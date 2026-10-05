@@ -15,19 +15,34 @@
 //  inbox is unread, the backlog marker is withheld and ``TransferSessionEvent/Payload/backlogUnavailable``
 //  is sent instead; the marker follows once storage recovered.
 //
+//  Background wakes: the system's wake-drained callback becomes a
+//  ``TransferSessionEvent/Payload/backgroundEventsFinished`` marker that joins the same ordered
+//  queue as terminal events, so it is never delivered ahead of an event still waiting to be
+//  stored. A marker that arrives while no manager is subscribed is delivered to the next one,
+//  after its replay.
+//
+//  Restarts: a refused continuation is recorded durably inside the callback (see
+//  ``RestartIntent``) and replaced by a fresh task under the same description. After a
+//  relaunch the intents are read back: the refused task's late completion is ignored and a
+//  cancel of the refused task reaches its replacement.
+//
 
 import Foundation
 
 actor TransferSessionHost {
-    /// A terminal event not yet durably stored, with the sequence number it was given.
+    /// A terminal event, or a wake marker (`event == nil`), not yet delivered, with the
+    /// sequence number it was given.
     private struct PendingEvent {
-        let event: TransferEvent
+        let event: TransferEvent?
         let receipt: UUID?
         var sequence: UInt64?
     }
 
     let identifier: String
     let storageRoot: URL
+    /// Whether the system keeps this session's tasks across launches (background mode), so a
+    /// restart recorded by an earlier process still names a live task.
+    let tasksOutliveProcess: Bool
     private let inbox: TransferInbox
     private let session: URLSession
     private let delegateQueue: OperationQueue
@@ -61,11 +76,18 @@ actor TransferSessionHost {
     private var submissions: [Int: TransferSubmission] = [:]
     /// Task identifiers the manager knows, mapped to the task that replaced them on a restart.
     private var replacements: [Int: Int] = [:]
+    /// Durable restarts, by refused task, read back after a relaunch or written in this process.
+    private var restarts: [Int: RestartIntent] = [:]
+    /// A wake marker arrived while no manager was subscribed.
+    private var wakeMarkerOwed = false
     private var lastProgress: [Int: Int64] = [:]
 
-    init(identifier: String, storageRoot: URL, options: URLSessionTransport.Options, storageRetryDelay: TimeInterval = 2) throws {
+    /// `tasksOutliveProcess` overrides the mode's answer (tests only: a foreground session
+    /// standing in for a background one).
+    init(identifier: String, storageRoot: URL, options: URLSessionTransport.Options, storageRetryDelay: TimeInterval = 2, tasksOutliveProcess: Bool? = nil) throws {
         self.identifier = identifier
         self.storageRoot = storageRoot
+        self.tasksOutliveProcess = tasksOutliveProcess ?? (options.mode == .background)
         self.sessionNetworkAccess = options.sessionNetworkAccess
         self.storageRetryDelay = UInt64(max(0.001, storageRetryDelay) * 1_000_000_000)
         let inbox = TransferInbox(storageRoot: storageRoot, sessionIdentifier: identifier)
@@ -80,7 +102,7 @@ actor TransferSessionHost {
         self.delegateQueue = queue
         var inspector = ResponseInspector()
         inspector.rejectedMediaTypes = options.rejectedMediaTypes
-        let delegate = TransferDelegate(channel: channel, capture: FileCapture(storageRoot: storageRoot, inbox: inbox, inspector: inspector, now: options.now))
+        let delegate = TransferDelegate(sessionIdentifier: identifier, channel: channel, capture: FileCapture(storageRoot: storageRoot, inbox: inbox, inspector: inspector, now: options.now))
         self.session = URLSession(configuration: options.makeConfiguration(identifier: identifier), delegate: delegate, delegateQueue: queue)
     }
 
@@ -113,6 +135,15 @@ actor TransferSessionHost {
         nextSequence = max(contents.state.reservedSequence, highest) + 1
         reservedSequence = nextSequence - 1
         unacknowledged = contents.events
+        for intent in contents.restarts {
+            if tasksOutliveProcess {
+                restarts[intent.taskIdentifier] = intent
+                if let replacement = intent.replacement { replacements[intent.taskIdentifier] = replacement }
+            } else {
+                // No task of a foreground session outlives its process.
+                inbox.removeRestart(intent.taskIdentifier)
+            }
+        }
         // A subscriber that arrived while the inbox was unread has received nothing yet.
         for stored in contents.events {
             if let event = stored.event.event { yield(stored.sequence, .transfer(event)) }
@@ -154,6 +185,11 @@ actor TransferSessionHost {
                 yield(stored.sequence, .transfer(event))
             }
         }
+        if wakeMarkerOwed {
+            // Behind the replay and anything still waiting to be stored.
+            wakeMarkerOwed = false
+            pending.append(PendingEvent(event: nil, receipt: nil, sequence: nil))
+        }
         let session = self.session
         let queue = delegateQueue
         let channel = self.channel
@@ -185,7 +221,7 @@ actor TransferSessionHost {
         } else {
             task = session.downloadTask(with: Self.request(for: submission))
         }
-        task.taskDescription = submission.taskDescription
+        task.taskDescription = submission.taskDescription(sessionIdentifier: identifier)
         submissions[task.taskIdentifier] = submission
         task.resume()
         // The task holds its own copy of the resume data; the file is no longer needed.
@@ -198,7 +234,7 @@ actor TransferSessionHost {
         let tasks = await Self.tasks(of: session)
         // Unknown tasks and tasks this package did not create are left alone.
         guard let task = tasks.first(where: { $0.taskIdentifier == target }),
-              let reference = TransferTaskReference(taskDescription: task.taskDescription, taskIdentifier: target) else { return }
+              let reference = TransferTaskReference(taskDescription: task.taskDescription, taskIdentifier: target, sessionIdentifier: identifier) else { return }
         guard producingResumeData, let download = task as? URLSessionDownloadTask else {
             task.cancel()
             return
@@ -243,6 +279,8 @@ actor TransferSessionHost {
     var urlSession: URLSession { session }
     var unacknowledgedSequences: [UInt64] { unacknowledged.map(\.sequence) }
     var pendingCount: Int { pending.count }
+    var restartIntents: [RestartIntent] { restarts.values.sorted { $0.taskIdentifier < $1.taskIdentifier } }
+    func replacement(for taskIdentifier: Int) -> Int? { replacements[taskIdentifier] }
     var isInboxLoaded: Bool { loaded }
     nonisolated var callbackChannel: AsyncStream<DelegateCallback>.Continuation { channel }
     nonisolated var callbackQueue: OperationQueue { delegateQueue }
@@ -287,7 +325,7 @@ actor TransferSessionHost {
     private func handle(_ callback: DelegateCallback) {
         switch callback {
         case .progress(let taskIdentifier, let description, let written, let expected):
-            guard let reference = TransferTaskReference(taskDescription: description, taskIdentifier: taskIdentifier) else { return }
+            guard let reference = reference(description, taskIdentifier) else { return }
             // Advisory: forwarded at most once per 64 KiB or 1 %, and at the end.
             let step = max(65_536, expected > 0 ? expected / 100 : 0)
             if let last = lastProgress[taskIdentifier], written - last < step, written != expected { return }
@@ -295,13 +333,14 @@ actor TransferSessionHost {
             emitAdvisory(.transfer(.progress(reference, bytesWritten: written, expectedBytes: expected > 0 ? expected : nil)))
 
         case .waiting(let taskIdentifier, let description):
-            guard let reference = TransferTaskReference(taskDescription: description, taskIdentifier: taskIdentifier) else { return }
+            guard let reference = reference(description, taskIdentifier) else { return }
             emitAdvisory(.transfer(.waiting(reference, .connectivity)))
 
         case .receipt(let receipt, let taskIdentifier, _):
             reportedTasks.insert(taskIdentifier)
             submissions[taskIdentifier] = nil
             lastProgress[taskIdentifier] = nil
+            finishRestarts(replacedBy: taskIdentifier)
             guard handledReceipts.insert(receipt.id).inserted, let event = receipt.event.event else { return }
             if replacements[taskIdentifier] != nil {
                 // The task was replaced by a restart: its outcome belongs to nobody. A file it
@@ -317,18 +356,25 @@ actor TransferSessionHost {
             // stored before anything after it is delivered.
             deliver(event, receipt: receipt.id)
 
-        case .restart(let taskIdentifier, let description):
+        case .restart(let taskIdentifier, let description, let request):
             reportedTasks.insert(taskIdentifier)
             lastProgress[taskIdentifier] = nil
-            restart(taskIdentifier, description: description)
+            restart(taskIdentifier, description: description, request: request)
 
         case .completed(let taskIdentifier, let description, let failure):
             lastProgress[taskIdentifier] = nil
             guard reportedTasks.remove(taskIdentifier) == nil else { return }
             submissions[taskIdentifier] = nil
-            guard let reference = TransferTaskReference(taskDescription: description, taskIdentifier: taskIdentifier) else { return }
+            guard let reference = reference(description, taskIdentifier) else { return }
+            // The refused task of a restart recorded before a relaunch: its replacement reports.
+            if let intent = restarts[taskIdentifier], intent.matches(reference) { return }
+            finishRestarts(replacedBy: taskIdentifier)
             // A task that ended without a usable file and without an error had no usable response.
             deliver(.failed(reference, failure ?? .invalidResponse), receipt: nil)
+
+        case .eventsFinished:
+            pending.append(PendingEvent(event: nil, receipt: nil, sequence: nil))
+            flushPending()
 
         case .barrier(let token):
             guard token == subscription else { return }
@@ -341,25 +387,63 @@ actor TransferSessionHost {
     }
 
     /// Starts the attempt again from zero under the same description. The manager keeps using the
-    /// task identifier it was given; it is mapped to the replacement.
-    private func restart(_ taskIdentifier: Int, description: String?) {
-        guard let reference = TransferTaskReference(taskDescription: description, taskIdentifier: taskIdentifier) else { return }
-        guard let submission = submissions.removeValue(forKey: taskIdentifier) else {
+    /// task identifier it was given; it is mapped to the replacement, durably. The request is the
+    /// submission's when this process made it, otherwise the system's copy of the refused
+    /// task's request without its range headers.
+    private func restart(_ taskIdentifier: Int, description: String?, request original: URLRequest?) {
+        guard let reference = reference(description, taskIdentifier) else { return }
+        let request: URLRequest
+        var fresh: TransferSubmission?
+        if let submission = submissions.removeValue(forKey: taskIdentifier) {
+            let renewed = TransferSubmission(itemID: submission.itemID, generation: submission.generation, url: submission.url, policy: submission.policy, resumeDataPath: nil, expectedLength: submission.expectedLength)
+            fresh = renewed
+            request = Self.request(for: renewed)
+        } else if let original, original.url != nil {
+            request = Self.restartRequest(from: original)
+        } else {
+            inbox.removeRestart(taskIdentifier)
+            restarts[taskIdentifier] = nil
             deliver(.failed(reference, .http(status: 416, retryAfter: nil)), receipt: nil)
             return
         }
-        let fresh = TransferSubmission(itemID: submission.itemID, generation: submission.generation, url: submission.url, policy: submission.policy, resumeDataPath: nil, expectedLength: submission.expectedLength)
-        let task = session.downloadTask(with: Self.request(for: fresh))
-        task.taskDescription = fresh.taskDescription
-        submissions[task.taskIdentifier] = fresh
+        let task = session.downloadTask(with: request)
+        task.taskDescription = TransferTaskReference.taskDescription(itemID: reference.itemID, generation: reference.generation, sessionIdentifier: identifier)
+        if let fresh { submissions[task.taskIdentifier] = fresh }
         for (known, current) in replacements where current == taskIdentifier { replacements[known] = task.taskIdentifier }
         replacements[taskIdentifier] = task.taskIdentifier
+        // Best effort: if the intent cannot be written the restart still runs in this process.
+        var intent = restarts[taskIdentifier] ?? RestartIntent(taskIdentifier: taskIdentifier, itemID: reference.itemID.rawValue, generation: reference.generation, replacement: nil)
+        intent.replacement = task.taskIdentifier
+        restarts[taskIdentifier] = intent
+        try? inbox.write(intent)
         task.resume()
         // The refused task normally ended already; make sure it cannot report anything else.
         let session = self.session
         Task {
             await Self.tasks(of: session).first { $0.taskIdentifier == taskIdentifier }?.cancel()
         }
+    }
+
+    /// The replacement `taskIdentifier` reported its outcome: the restarts it finished are done.
+    private func finishRestarts(replacedBy taskIdentifier: Int) {
+        for intent in restarts.values where intent.replacement == taskIdentifier {
+            restarts[intent.taskIdentifier] = nil
+            inbox.removeRestart(intent.taskIdentifier)
+        }
+    }
+
+    /// The task's item and attempt in this session, `nil` for a foreign task.
+    private func reference(_ description: String?, _ taskIdentifier: Int) -> TransferTaskReference? {
+        TransferTaskReference(taskDescription: description, taskIdentifier: taskIdentifier, sessionIdentifier: identifier)
+    }
+
+    /// A refused continuation's request, as a fresh request from zero.
+    static func restartRequest(from original: URLRequest) -> URLRequest {
+        var request = original
+        request.setValue(nil, forHTTPHeaderField: "Range")
+        request.setValue(nil, forHTTPHeaderField: "If-Range")
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        return request
     }
 
     // MARK: Emitting
@@ -381,12 +465,18 @@ actor TransferSessionHost {
             do {
                 let sequence = try head.sequence ?? allocateSequence()
                 pending[0].sequence = sequence
+                guard let event = head.event else {
+                    // A wake marker: nothing to store, everything before it is stored.
+                    pending.removeFirst()
+                    yield(sequence, .backgroundEventsFinished)
+                    continue
+                }
                 // Terminal events always have a stored form.
-                let entry = StoredEvent(sequence: sequence, receipt: head.receipt, event: StoredTransferEvent(head.event)!)
+                let entry = StoredEvent(sequence: sequence, receipt: head.receipt, event: StoredTransferEvent(event)!)
                 try inbox.write(entry)
                 unacknowledged.append(entry)
                 pending.removeFirst()
-                yield(sequence, .transfer(head.event))
+                yield(sequence, .transfer(event))
                 if let receipt = head.receipt { inbox.removeReceipt(receipt) }
             } catch {
                 scheduleStorageRetry()
@@ -427,7 +517,16 @@ actor TransferSessionHost {
     }
 
     private func yield(_ sequence: UInt64, _ payload: TransferSessionEvent.Payload) {
-        subscriber?.yield(TransferSessionEvent(sequence: sequence, payload: payload))
+        guard let subscriber else {
+            // Stored events are replayed to the next subscriber; a wake marker is owed to it.
+            if payload == .backgroundEventsFinished { wakeMarkerOwed = true }
+            return
+        }
+        if case .terminated = subscriber.yield(TransferSessionEvent(sequence: sequence, payload: payload)),
+           payload == .backgroundEventsFinished {
+            // The manager stopped reading (detached): the next one gets the marker.
+            wakeMarkerOwed = true
+        }
         lastYielded = sequence
     }
 

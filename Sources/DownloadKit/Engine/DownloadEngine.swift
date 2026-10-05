@@ -264,7 +264,9 @@ actor DownloadEngine {
     /// Restores in-flight intent against the tasks the session still knows about.
     ///
     /// Order:
-    /// 1. Map every system task through its description. Unmapped tasks are left alone. A
+    /// 1. Map every system task through its description, in this session
+    ///    (``SystemTransferTask/reference(inSession:)``). Unmapped tasks, and tasks whose
+    ///    description names another session, are foreign and left alone. A
     ///    task matching an awaiting record's generation is adopted (its binding is written if
     ///    it was lost) instead of being replaced. Any other package task, including one a
     ///    paused, cancelled or removed record asked to stop, is cancelled again.
@@ -292,12 +294,12 @@ actor DownloadEngine {
         let tasks = await session.systemTasks().sorted { $0.taskIdentifier < $1.taskIdentifier }
         var live: [Int: TransferTaskReference] = [:]
         for task in tasks {
-            if let reference = task.reference { live[task.taskIdentifier] = reference }
+            if let reference = task.reference(inSession: session.identifier) { live[task.taskIdentifier] = reference }
         }
         var adopted: Set<AttemptKey> = []
         var stopped: Set<Int> = []
         for task in tasks {
-            guard let reference = task.reference else { continue }
+            guard let reference = task.reference(inSession: session.identifier) else { continue }
             guard let record = machine?.records[reference.itemID] else {
                 await stopTask(reference.taskIdentifier, of: reference.itemID, producingResumeData: false)
                 stopped.insert(reference.taskIdentifier)
@@ -447,7 +449,7 @@ actor DownloadEngine {
         guard !orphanCandidates.isEmpty, let session else { return }
         var live: [AttemptKey: Int] = [:]
         for task in await session.systemTasks() {
-            guard let reference = task.reference else { continue }
+            guard let reference = task.reference(inSession: session.identifier) else { continue }
             live[AttemptKey(id: reference.itemID, generation: reference.generation)] = reference.taskIdentifier
         }
         for key in orphanCandidates.map({ AttemptKey(id: $0.key, generation: $0.value) }).sorted() {
@@ -519,7 +521,7 @@ actor DownloadEngine {
         guard !orphanCandidates.isEmpty, let session else { return true }
         var live: [AttemptKey: Int] = [:]
         for task in await session.systemTasks() {
-            guard let reference = task.reference else { continue }
+            guard let reference = task.reference(inSession: session.identifier) else { continue }
             live[AttemptKey(id: reference.itemID, generation: reference.generation)] = reference.taskIdentifier
         }
         var complete = true

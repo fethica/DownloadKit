@@ -11,6 +11,11 @@
 //    A file is deleted once the manager acknowledged its sequence number.
 //  - `state.json`: the highest reserved sequence number, so numbers are never reused across
 //    launches.
+//  - `restarts/`: one file per refused continuation (416, or a range answer that cannot be
+//    trusted), written inside the system callback before it returns, naming the task, its item
+//    and attempt, and later the replacement task. It lets a relaunched process recognise the
+//    refused task's late completion and the replacement, instead of reporting a failure. No URL
+//    is written: the replacement request is rebuilt from the system's own copy of the request.
 //
 //  Order inside the callback: the receipt (naming the staging file the capture will use) is
 //  written before the temporary file is moved, so a moved file always has a durable association.
@@ -130,6 +135,21 @@ struct CaptureReceipt: Codable, Hashable, Sendable {
     let event: StoredTransferEvent
 }
 
+/// A refused continuation that is being started again from zero.
+struct RestartIntent: Codable, Hashable, Sendable {
+    /// The task whose continuation was refused.
+    let taskIdentifier: Int
+    let itemID: String
+    let generation: UInt64
+    /// The task that replaced it, once created.
+    var replacement: Int?
+
+    /// Whether `reference` names the same item and attempt (a reused task number does not).
+    func matches(_ reference: TransferTaskReference) -> Bool {
+        reference.itemID.rawValue == itemID && reference.generation == generation
+    }
+}
+
 /// One sequenced terminal event.
 struct StoredEvent: Codable, Hashable, Sendable {
     let sequence: UInt64
@@ -156,6 +176,8 @@ struct TransferInbox: Sendable {
         var events: [StoredEvent]
         /// Receipts, oldest first.
         var receipts: [CaptureReceipt]
+        /// Restarts not yet finished, by refused task.
+        var restarts: [RestartIntent]
         var state: State
     }
 
@@ -184,6 +206,7 @@ struct TransferInbox: Sendable {
 
     var receipts: URL { directory.appendingPathComponent("receipts", isDirectory: true) }
     var events: URL { directory.appendingPathComponent("events", isDirectory: true) }
+    var restarts: URL { directory.appendingPathComponent("restarts", isDirectory: true) }
     var stateFile: URL { directory.appendingPathComponent("state.json", isDirectory: false) }
 
     /// `url`, refused when it leaves the storage root or goes through a symbolic link.
@@ -194,6 +217,7 @@ struct TransferInbox: Sendable {
     func prepare() throws {
         try FileManager.default.createDirectory(at: try confined(receipts), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: try confined(events), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: try confined(restarts), withIntermediateDirectories: true)
         var parent = try confined(directory.deletingLastPathComponent())
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
@@ -210,9 +234,11 @@ struct TransferInbox: Sendable {
         for entry in stored where entry.event.event == nil { throw UnreadableEntry(name: "event \(entry.sequence)") }
         let pending: [CaptureReceipt] = try entries(in: receipts)
         for receipt in pending where receipt.event.event == nil { throw UnreadableEntry(name: "receipt \(receipt.id)") }
+        let restarting: [RestartIntent] = try entries(in: restarts)
         return Contents(
             events: stored.sorted { $0.sequence < $1.sequence },
             receipts: pending.sorted { ($0.written, $0.id.uuidString) < ($1.written, $1.id.uuidString) },
+            restarts: restarting.sorted { $0.taskIdentifier < $1.taskIdentifier },
             state: state
         )
     }
@@ -263,6 +289,23 @@ struct TransferInbox: Sendable {
     private func url(forSequence sequence: UInt64) -> URL {
         let digits = String(sequence)
         return events.appendingPathComponent(String(repeating: "0", count: max(0, 20 - digits.count)) + digits + ".json", isDirectory: false)
+    }
+
+    // MARK: Restarts
+
+    func write(_ restart: RestartIntent) throws {
+        try Self.encoder.encode(restart).write(to: try confined(restartURL(restart.taskIdentifier)), options: .atomic)
+    }
+
+    /// Deletes a finished restart. Best effort: a leftover only suppresses the refused task's
+    /// late completion once more.
+    func removeRestart(_ taskIdentifier: Int) {
+        guard let url = try? confined(restartURL(taskIdentifier)) else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private func restartURL(_ taskIdentifier: Int) -> URL {
+        restarts.appendingPathComponent("task-\(taskIdentifier).json", isDirectory: false)
     }
 
     // MARK: State

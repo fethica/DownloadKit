@@ -22,8 +22,13 @@ enum DelegateCallback: Sendable {
     /// else is delivered.
     case receipt(CaptureReceipt, taskIdentifier: Int, durable: Bool)
     /// The continuation of a resumed task cannot be trusted; start it again from zero.
-    case restart(taskIdentifier: Int, description: String?)
+    /// `request` is the system's copy of the task's request, used when the submission is not
+    /// known in this process (the task was created before a relaunch).
+    case restart(taskIdentifier: Int, description: String?, request: URLRequest? = nil)
     case completed(taskIdentifier: Int, description: String?, failure: TransferFailure?)
+    /// The system delivered every event of a background wake
+    /// (`urlSessionDidFinishEvents(forBackgroundURLSession:)`).
+    case eventsFinished
     /// Every callback queued before this one has been forwarded.
     case barrier(UUID)
     case invalidated
@@ -33,7 +38,8 @@ enum DelegateCallback: Sendable {
 struct FileCapture: Sendable {
     enum Outcome: Sendable {
         case receipt(CaptureReceipt, durable: Bool)
-        case restart
+        /// The restart intent was written (`durable`) or only lives in memory.
+        case restart(durable: Bool)
     }
 
     let storageRoot: URL
@@ -63,7 +69,10 @@ struct FileCapture: Sendable {
         )
         switch inspector.inspect(evidence, now: now()) {
         case .restart:
-            return .restart
+            // Recorded before the callback returns, so a relaunch knows the refused task was
+            // replaced rather than failed.
+            let intent = RestartIntent(taskIdentifier: reference.taskIdentifier, itemID: reference.itemID.rawValue, generation: reference.generation, replacement: nil)
+            return .restart(durable: (try? inbox.write(intent)) != nil)
         case .fail(let failure):
             return record(.failed(reference, failure))
         case .accept(let validators, let bytes):
@@ -120,17 +129,20 @@ struct FileCapture: Sendable {
 
 /// The delegate of the package's URLSession.
 final class TransferDelegate: NSObject, URLSessionDownloadDelegate, Sendable {
+    private let sessionIdentifier: String
     private let channel: AsyncStream<DelegateCallback>.Continuation
     private let capture: FileCapture
 
-    init(channel: AsyncStream<DelegateCallback>.Continuation, capture: FileCapture) {
+    init(sessionIdentifier: String, channel: AsyncStream<DelegateCallback>.Continuation, capture: FileCapture) {
+        self.sessionIdentifier = sessionIdentifier
         self.channel = channel
         self.capture = capture
     }
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        // A task this package did not create is never touched: its file is left to the system.
-        guard let reference = TransferTaskReference(taskDescription: downloadTask.taskDescription, taskIdentifier: downloadTask.taskIdentifier) else { return }
+        // A task this package did not create, or one naming another session, is never
+        // touched: its file is left to the system.
+        guard let reference = TransferTaskReference(taskDescription: downloadTask.taskDescription, taskIdentifier: downloadTask.taskIdentifier, sessionIdentifier: sessionIdentifier) else { return }
         let outcome = capture.capture(
             location: location,
             response: downloadTask.response,
@@ -141,7 +153,7 @@ final class TransferDelegate: NSObject, URLSessionDownloadDelegate, Sendable {
         case .receipt(let receipt, let durable):
             channel.yield(.receipt(receipt, taskIdentifier: downloadTask.taskIdentifier, durable: durable))
         case .restart:
-            channel.yield(.restart(taskIdentifier: downloadTask.taskIdentifier, description: downloadTask.taskDescription))
+            channel.yield(.restart(taskIdentifier: downloadTask.taskIdentifier, description: downloadTask.taskDescription, request: downloadTask.originalRequest ?? downloadTask.currentRequest))
         }
     }
 
@@ -160,6 +172,13 @@ final class TransferDelegate: NSObject, URLSessionDownloadDelegate, Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
         let original = task.originalRequest?.url
         completionHandler(ResponseInspector.allowsRedirect(from: original, to: request.url) ? request : nil)
+    }
+
+    /// Background sessions only: the system delivered every event of the wake. Called on the
+    /// delegate queue after those events' callbacks, so it reaches the session's actor behind
+    /// them.
+    func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        channel.yield(.eventsFinished)
     }
 
     func urlSession(_ session: URLSession, didBecomeInvalidWithError error: (any Error)?) {

@@ -18,21 +18,73 @@ public struct TransferTaskReference: Hashable, Sendable {
     }
 
     /// Maps a task back to its item and attempt from the durable description written at
-    /// submission (see ``TransferSubmission/taskDescription``). Returns `nil` for any
-    /// description this package did not write.
+    /// submission (see ``TransferSubmission/taskDescription(sessionIdentifier:)``). Returns
+    /// `nil` for any description this package did not write. The session named in the
+    /// description is not checked; use ``init(taskDescription:taskIdentifier:sessionIdentifier:)``
+    /// to refuse a task of another session.
     public init?(taskDescription: String?, taskIdentifier: Int) {
-        guard let description = taskDescription, description.hasPrefix(Self.descriptionPrefix) else { return nil }
-        let body = description.dropFirst(Self.descriptionPrefix.count)
+        guard let parsed = Self.parse(taskDescription) else { return nil }
+        self.init(itemID: parsed.itemID, generation: parsed.generation, taskIdentifier: taskIdentifier)
+    }
+
+    /// Like ``init(taskDescription:taskIdentifier:)``, and also `nil` when the description names
+    /// a session other than `sessionIdentifier`. A description written before the session was
+    /// recorded in it (`downloadkit/1/...`) carries no session and is accepted: the system lists
+    /// a task only for the session that owns it.
+    public init?(taskDescription: String?, taskIdentifier: Int, sessionIdentifier: String) {
+        guard let parsed = Self.parse(taskDescription) else { return nil }
+        if let tag = parsed.sessionTag, tag != Self.sessionTag(sessionIdentifier) { return nil }
+        self.init(itemID: parsed.itemID, generation: parsed.generation, taskIdentifier: taskIdentifier)
+    }
+
+    /// Format 1: `downloadkit/1/<generation>/<item>`. Format 2 adds the session:
+    /// `downloadkit/2/<session tag>/<generation>/<item>`, where the tag is 16 lowercase
+    /// hexadecimal digits of the FNV-1a 64-bit hash of the session identifier's UTF-8 bytes.
+    /// The item identifier comes last because it may contain slashes.
+    private static func parse(_ description: String?) -> (itemID: DownloadID, generation: UInt64, sessionTag: String?)? {
+        guard let description else { return nil }
+        var body: Substring
+        var tag: String?
+        if description.hasPrefix(descriptionPrefix) {
+            body = description.dropFirst(descriptionPrefix.count)
+        } else if description.hasPrefix(sessionDescriptionPrefix) {
+            body = description.dropFirst(sessionDescriptionPrefix.count)
+            guard let separator = body.firstIndex(of: "/") else { return nil }
+            let candidate = String(body[body.startIndex..<separator])
+            guard candidate.count == 16, candidate.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else { return nil }
+            tag = candidate
+            body = body[body.index(after: separator)...]
+        } else {
+            return nil
+        }
         guard let separator = body.firstIndex(of: "/"),
               let generation = UInt64(body[body.startIndex..<separator]),
               let itemID = try? DownloadID(String(body[body.index(after: separator)...])) else { return nil }
-        self.init(itemID: itemID, generation: generation, taskIdentifier: taskIdentifier)
+        return (itemID, generation, tag)
     }
 
     static let descriptionPrefix = "downloadkit/1/"
+    static let sessionDescriptionPrefix = "downloadkit/2/"
 
+    /// The format 1 description, without a session.
     static func taskDescription(itemID: DownloadID, generation: UInt64) -> String {
         "\(descriptionPrefix)\(generation)/\(itemID.rawValue)"
+    }
+
+    /// The format 2 description, naming the session.
+    static func taskDescription(itemID: DownloadID, generation: UInt64, sessionIdentifier: String) -> String {
+        "\(sessionDescriptionPrefix)\(sessionTag(sessionIdentifier))/\(generation)/\(itemID.rawValue)"
+    }
+
+    /// A stable, fixed-length tag for a session identifier (FNV-1a, 64 bits).
+    static func sessionTag(_ sessionIdentifier: String) -> String {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in sessionIdentifier.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x0000_0100_0000_01b3
+        }
+        let digits = String(hash, radix: 16)
+        return String(repeating: "0", count: 16 - digits.count) + digits
     }
 }
 
@@ -48,9 +100,17 @@ public struct SystemTransferTask: Hashable, Sendable {
     }
 
     /// The item and attempt this task belongs to, or `nil` for a task the package did not
-    /// create. Unmapped tasks are left alone, never adopted or cancelled.
+    /// create. Unmapped tasks are left alone, never adopted or cancelled. Does not check the
+    /// session; see ``reference(inSession:)``.
     public var reference: TransferTaskReference? {
         TransferTaskReference(taskDescription: taskDescription, taskIdentifier: taskIdentifier)
+    }
+
+    /// The item and attempt this task belongs to in the session `sessionIdentifier`, or `nil`
+    /// for a task the package did not create or whose description names another session.
+    /// The manager reconciles with this: a task of another session is foreign and untouched.
+    public func reference(inSession sessionIdentifier: String) -> TransferTaskReference? {
+        TransferTaskReference(taskDescription: taskDescription, taskIdentifier: taskIdentifier, sessionIdentifier: sessionIdentifier)
     }
 }
 
@@ -78,11 +138,19 @@ public struct TransferSubmission: Hashable, Sendable {
         self.expectedLength = expectedLength
     }
 
-    /// The durable description the session sets on the task before resuming it, so the task
-    /// can be mapped back to its item and generation after a relaunch even when the binding
-    /// was never written. Parse it with ``TransferTaskReference/init(taskDescription:taskIdentifier:)``.
+    /// The durable description without a session (format 1). Prefer
+    /// ``taskDescription(sessionIdentifier:)``; this form is still accepted for any session.
     public var taskDescription: String {
         TransferTaskReference.taskDescription(itemID: itemID, generation: generation)
+    }
+
+    /// The durable description the session sets on the task before resuming it: item,
+    /// generation and the session's identity, so the task can be mapped back to its item and
+    /// attempt after a relaunch even when the binding was never written, and a task listed
+    /// under another session is never adopted. Parse it with
+    /// ``TransferTaskReference/init(taskDescription:taskIdentifier:sessionIdentifier:)``.
+    public func taskDescription(sessionIdentifier: String) -> String {
+        TransferTaskReference.taskDescription(itemID: itemID, generation: generation, sessionIdentifier: sessionIdentifier)
     }
 
     func with(url: URL) -> TransferSubmission {
