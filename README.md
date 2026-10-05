@@ -69,7 +69,10 @@ Until the production adapters land, `dependencies` must be supplied by the host 
 - The host creates one `DownloadManager` per storage scope at launch and keeps it. There is no shared instance.
 - `start()` resolves the storage root, claims it, loads the index and reconciles it with the transfer session. A second manager for the same root or session identifier in the same process fails with `ownerAlreadyActive`.
 - Commands (`enqueue`, `pause`, `resume`, `cancel`, `retry`, `remove`, `setDefaultPolicy`, `setPolicy`) and transfer events are applied one at a time in arrival order. The index is written before in-memory state changes and before any task is started or cancelled.
-- `detach()` releases the in-process owner without cancelling transfers. Ending a snapshot subscription or dropping a view never affects transfers.
+- Reconciliation at start maps every system task through the durable description written at submission. A task that matches an item's current attempt is adopted even if its binding was never written; other package tasks, including ones a paused, cancelled or removed item asked to stop, are cancelled again; tasks the package did not create are left alone. An item whose task is gone is resubmitted only after the session reports that its backlog was delivered, so a completion buffered before start is applied first.
+- Session events are applied in order and acknowledged to the session only once committed. A completion, failure, retry, binding or removal whose index write is rejected is kept and retried at the start of every later command, or explicitly with `flushPendingWork()`; only progress and waiting updates may be dropped.
+- The host forwards a background-session wake to `handleBackgroundEvents(forSession:completionHandler:)`, which returns `false` for other identifiers and may be called before `start()` finishes. The handler is called once, on the main actor, after the manager has applied every event of the wake.
+- `detach()` releases the in-process owner without cancelling transfers. While a `LocalFileLease` is outstanding the storage claim is kept, so no other manager can take over the root and delete a leased file; a detached manager never deletes files itself. Ending a snapshot iteration in any way, including `break`, unsubscribes; neither it nor dropping a view affects transfers.
 
 ### Identity and idempotence
 
@@ -85,35 +88,39 @@ Items are identified by a host-supplied `DownloadID`. The source URL can change 
 
 ### Pause, cancel, remove
 
-- **Pause**: keeps the record and asks the system for resume data. Resume starts a new attempt with it; resume data is best effort.
-- **Cancel**: ends the transfer intent and automatic retries. The record and any resume data stay; the item becomes `failed(.cancelled)` and `retry` restarts it.
+- **Pause**: keeps the record and asks the system for resume data. Resume starts a new attempt with it; resume data is best effort. A new attempt without accepted resume data starts from zero bytes.
+- **Cancel**: ends the transfer intent and automatic retries. The record, any resume data and any bytes the attempt already captured stay; the item becomes `failed(.cancelled)` and `retry` restarts it.
 - **Remove**: cancels, tombstones the record with a new generation so no late event can bring it back, then deletes only that item's own files once every `LocalFileLease` has ended. Group removal takes explicit ids.
+- Each stop keeps the stopped task's binding in the index until the session accepted the cancellation, so a stop interrupted by process exit is enforced again on the next start.
+- Captured bytes belong to their attempt: pausing, cancelling, resuming or retrying an item whose download finished but is not yet validated never starts a new transfer over them; resume and retry run the pending validation again. A completion replayed with the same file is a no-op, and a rejected completion deletes its file only when no record owns it.
 
 ### Failures and retries
 
-Failures are classified as network transient, permanent HTTP, authentication, storage, integrity, invalid response, cancelled or policy wait. Only transient failures retry automatically: bounded exponential backoff with jitter, three retries by default, Retry-After honoured. Policy waits spend no attempt. A user retry resets the count and, for an `unauthorized` failure, asks the host's `URLRefreshing` for a fresh URL. Persisted failure keys (`network`, `http`, `storage_full`, `integrity`, ...) are stable.
+Failures are classified as network transient, permanent HTTP, authentication, storage, integrity, invalid response, cancelled or policy wait. Only transient failures retry automatically: bounded exponential backoff with jitter, three retries by default. A Retry-After value, capped at `maximumRetryAfter`, can raise the delay but never shorten it. Policy waits spend no attempt. A user retry resets the count and, for an `unauthorized` failure, asks the host's `URLRefreshing` for a fresh URL. Persisted failure keys (`network`, `http`, `storage_full`, `integrity`, ...) are stable.
 
 Retry timers only run while the process runs. The due time is stored, and the next `start()` re-evaluates it.
 
 ### Network policy
 
-`NetworkPolicy` is explicit and persisted: `allowsCellular`, `allowsExpensive`, `allowsConstrained` and a scheduling hint. The default, `unmeteredOnly`, refuses cellular and expensive networks and waits while the network is constrained (Low Data Mode). Non-expensive does not prove Wi-Fi, and strict Wi-Fi is not offered because it cannot be enforced for background transfers. Changing the default policy resubmits each queued, active or waiting item exactly once; paused and failed items use it on their next attempt. Path observation is only used to explain waits.
+`NetworkPolicy` is explicit and persisted: `allowsCellular`, `allowsExpensive`, `allowsConstrained` and a scheduling hint. The default, `unmeteredOnly`, refuses cellular and expensive networks and waits while the network is constrained (Low Data Mode). Non-expensive does not prove Wi-Fi, and strict Wi-Fi is not offered because it cannot be enforced for background transfers. Changing the default policy resubmits each queued, active or waiting item exactly once; paused and failed items use it on their next attempt. Path observation is only used to explain waits. One manager owns one session identifier: a per-item scheduling preference is applied per request where the platform allows it and is otherwise a hint; separate sessions per policy are not supported.
 
 ## Storage and persistence
 
-**Storage root.** `Application Support/<namespace>/`, where the namespace is chosen by the host; there is no default namespace and no fallback to Caches or temporary storage. If the root cannot be created, `start()` throws `storageUnavailable`. Inside the root the package owns `staging/` (captured, not yet validated files), `media/` (completed files) and the index. `media/` and `staging/` are excluded from backup; the index is kept, so a restored device reports `missing` items instead of pretending they are complete.
+**Storage root.** `Application Support/<namespace>/`, where the namespace is chosen by the host; there is no default namespace and no fallback to Caches or temporary storage. If the root cannot be created, `start()` throws `storageUnavailable`. Inside the root the package owns `staging/` (captured, not yet validated files), `media/` (completed files) and the index. `media/` and `staging/` are excluded from backup; the index is kept. At start, and on lookup, a completed item whose file is verifiably absent becomes `missing` instead of pretending to be complete. A file that cannot be inspected (permission, file protection, I/O) is never treated as absent: lookup throws `fileAccessFailed` and the record is kept.
 
 **Relative paths only.** Every path in the index is relative to the root and re-validated when decoded, so a changed sandbox path or a tampered index cannot point outside the root. File names come from internal counters, never from ids, URLs or server-provided names.
 
-**Index record.** One `IndexRecord` per item: id, request identity (source URL, revision, expected length, checksum), metadata, optional policy, phase, attempt generation, automatic retry count and retry time, task binding (session identifier, task identifier, generation), byte counts, HTTP validators, integrity, finalisation journal, staging/final/resume-data paths and timestamps. Generations come from one counter per index and are never reused, so events from an old attempt can never match a removed or re-enqueued item. Headers and credentials are never stored.
+**Index record.** One `IndexRecord` per item: id, request identity (source URL, revision, expected length, checksum), metadata, optional policy, phase, attempt generation, automatic retry count and retry time, task binding (session identifier, task identifier, generation), byte counts, HTTP validators, integrity, finalisation journal, staging/final/resume-data paths and timestamps. Generations come from one counter per index and are never reused, so events from an old attempt can never match a removed or re-enqueued item. Records can be rebuilt by external stores through the public `IndexRecord` initialiser, which rejects contradictory fields.
+
+**Credentials.** Headers are never stored, and source URLs with a user or password are rejected (`credentialsInURL`). The source URL is otherwise stored as given, query included. A host whose URLs carry signed query credentials that must stay out of the index enqueues a credential-free URL and returns the signed one from `URLRefreshing.transferURL(for:sourceURL:metadata:)`, which is resolved before every attempt and never persisted. The package never logs URLs.
 
 **Schema versioning.** `IndexSchema.currentVersion` is 1. A newer stored version fails with `unsupportedSchema` and is left untouched; an unreadable index fails with `corruptIndex` and is preserved. The package never resets an index or deletes unrecognised files to recover.
 
-**Finalisation journal.** `notStarted` → `captured` (temporary file moved into `staging/` before the system callback returns) → `validated` → `renamed` (atomic rename into `media/`) → `committed`. Only a committed record is `completed`. Until validation and atomic rename are implemented, captured files stay captured and are never handed out.
+**Finalisation journal.** `notStarted` → `captured` (temporary file moved into `staging/` before the system callback returns, committed with its byte count and validators) → `committed`. Between the two, validation, flush and an atomic rename to the deterministic destination `media/item-<generation>` run outside the command chain; they are idempotent, so an interruption anywhere in between is recovered by finalising the same generation again at the next start. Only a committed record is `completed`. Until validation and atomic rename are implemented, captured files stay captured and are never handed out.
 
 ## Concurrency
 
-The manager is a `Sendable` facade over one actor. All mutable state is actor-isolated; dependencies are `Sendable` protocols; snapshots and events are immutable values. The library uses no `@unchecked Sendable`, `nonisolated(unsafe)` or detached tasks, and a test enforces it.
+The manager is a `Sendable` facade over one actor. All mutable state is actor-isolated; dependencies are `Sendable` protocols; snapshots and events are immutable values. The library uses no `@unchecked Sendable`, `nonisolated(unsafe)` or detached tasks. Swift 6 language mode with complete checking is what enforces isolation; a source test additionally trips on those spellings and on non-Foundation imports, as a lexical check only.
 
 ## Testing
 
@@ -121,7 +128,7 @@ The manager is a `Sendable` facade over one actor. All mutable state is actor-is
 swift test
 ```
 
-The tests drive the manager with fakes: a scripted transfer session, an in-memory JSON index, an in-memory file system with fault injection, a manual clock and fixed jitter. No test sleeps. They cover every state machine transition, stale-generation rejection, idempotence, ordering, persistence-before-effects, schema refusal, the storage root rule, leases, retries, policy changes and snapshot throttling.
+The tests drive the manager with fakes: a scripted transfer session, an in-memory JSON index, an in-memory file system with fault injection, a manual clock and fixed jitter. No test sleeps. They cover the command and event transitions exercised in the state machine suites, stale-generation rejection, captured-byte ownership, idempotence, ordering, persistence-before-effects, rejected index writes, restart reconciliation (buffered completions, lost bindings, interrupted stops and renames), schema refusal, the storage root rule, leases across detach, retries, policy changes, background-wake completion and snapshot subscriptions. A separate test target compiles external adapters against the public surface only. They do not cover a real URLSession, SQLite store or file system, which do not exist yet.
 
 ## License
 
