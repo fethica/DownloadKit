@@ -7,32 +7,47 @@ import Foundation
 
 /// The production transfer session factory: delegate-based URLSession download tasks.
 ///
-/// This version runs a **foreground** session only. Transfers stop when the process ends; the
-/// background configuration, the relaunch path and the host's background-wake forwarding are
-/// not part of it yet. ``Mode`` exists so a background mode can be added as an option without
-/// changing this type's shape.
+/// Two modes:
+/// - ``Mode/foreground``: an ephemeral session in this process. Transfers end with the process.
+/// - ``Mode/background``: a background session under the manager's stable session identifier.
+///   The system runs its transfers out of process and keeps them while the app is suspended or
+///   was terminated by the system, and relaunches the app in the background to deliver their
+///   events (`sessionSendsLaunchEvents`). The host forwards that relaunch to
+///   ``BackgroundTransferEvents`` (or ``DownloadManager/handleBackgroundEvents(forSession:completionHandler:)``);
+///   see the README for the integration and the platform limits. Background sessions are
+///   process-wide: every background transport in a process shares one session (and one
+///   delegate, retained for the life of the process) per identifier, because the system allows
+///   only one session object per background identifier.
 ///
-/// What it guarantees:
-/// - Each task carries the description from ``TransferSubmission/taskDescription`` (item and
-///   attempt generation) before it is resumed, so it can be mapped back without a stored
-///   binding. The session identity is the URLSession the task belongs to.
+/// What it guarantees, in both modes:
+/// - Each task carries the description from ``TransferSubmission/taskDescription(sessionIdentifier:)``
+///   (item, attempt generation and session identity) before it is resumed, so it can be mapped
+///   back without a stored binding. A task whose description names another session is foreign.
 /// - A finished download is judged (status, range continuation, length, media type) and, when
 ///   usable, moved into `staging/` inside the delegate callback, before it returns, with a
 ///   durable receipt. Only then is anything delivered.
 /// - Terminal events are written to a durable inbox under `<root>/transfer/` before they are
 ///   delivered, keep their sequence numbers when delivered again (to a later session object
 ///   or after a relaunch), and are deleted only when acknowledged. The backlog marker follows
-///   the replay, the system task list and every callback queued before it.
+///   the replay, the system task list and every callback queued before it. The system's
+///   wake-drained callback (`urlSessionDidFinishEvents(forBackgroundURLSession:)`) becomes
+///   ``TransferSessionEvent/Payload/backgroundEventsFinished``, in order behind every event
+///   before it and never ahead of one still waiting to be stored.
 /// - Resume data is opaque: it is used only when it is a property list and the session's
 ///   network flags are no more permissive than the item's policy; otherwise the attempt starts
 ///   from zero. A continuation the server refuses (416) or answers with another representation
-///   is started again from zero, never appended.
+///   is started again from zero, never appended. That restart is recorded in the inbox inside
+///   the callback, so a relaunch neither loses it nor turns it into a failure.
 /// - Tasks the package did not create are listed by ``TransferSession/systemTasks()`` and
 ///   never cancelled, captured or reported.
 /// - No URL, header or credential is written by the adapter or logged; the transfer URL of
 ///   each attempt comes from ``URLRefreshing/transferURL(for:sourceURL:metadata:)`` and lives
-///   only in the system's request. The foreground session is ephemeral (no persistent cookie,
-///   cache or credential storage).
+///   only in the system's request. Neither mode keeps a URL cache, cookie store or credential
+///   store.
+///
+/// What macOS tests cannot show: a background session's transfers run in a system process
+/// that URLProtocol stubs cannot reach, so the background mode is covered by its configuration
+/// and by the shared delegate and inbox code, not by an end-to-end transfer.
 public struct URLSessionTransport: TransferSessionFactory {
     /// How the system session is configured.
     public struct Mode: Hashable, Sendable {
@@ -40,6 +55,10 @@ public struct URLSessionTransport: TransferSessionFactory {
 
         /// An ephemeral session in this process. Transfers end with the process.
         public static let foreground = Mode(rawValue: "foreground")
+        /// A background session under the manager's session identifier: transfers continue
+        /// while the app is suspended or after the system terminated it, and the system
+        /// relaunches the app to deliver their events. Not after the user force-quits the app.
+        public static let background = Mode(rawValue: "background")
     }
 
     public struct Options: Sendable {
@@ -55,6 +74,9 @@ public struct URLSessionTransport: TransferSessionFactory {
         public var rejectedMediaTypes: Set<String>
         /// The time used to read HTTP-date `Retry-After` values.
         public var now: @Sendable () -> Date
+        /// The longest one task may take, waiting included, before the system gives up on it
+        /// (`timeoutIntervalForResource`). Defaults to seven days, the system's own default.
+        public var resourceTimeout: TimeInterval
         /// Adjusts the configuration before the session is created (timeouts, protocol classes in
         /// tests). The network flags set from ``sessionNetworkAccess`` should not be widened here.
         public var configure: (@Sendable (URLSessionConfiguration) -> Void)?
@@ -63,34 +85,63 @@ public struct URLSessionTransport: TransferSessionFactory {
             mode: Mode = .foreground,
             sessionNetworkAccess: NetworkPolicy = .default,
             rejectedMediaTypes: Set<String> = ["text/html", "application/xhtml+xml"],
+            resourceTimeout: TimeInterval = 7 * 24 * 60 * 60,
             now: @escaping @Sendable () -> Date = { Date() },
             configure: (@Sendable (URLSessionConfiguration) -> Void)? = nil
         ) {
             self.mode = mode
             self.sessionNetworkAccess = sessionNetworkAccess
             self.rejectedMediaTypes = rejectedMediaTypes
+            self.resourceTimeout = max(1, resourceTimeout)
             self.now = now
             self.configure = configure
         }
 
+        /// The session configuration for `identifier`.
+        ///
+        /// Mapping, both modes: the network flags come from ``sessionNetworkAccess`` (each
+        /// request narrows them further with its item's policy), `waitsForConnectivity` is on,
+        /// there is no URL cache, cookie store or credential store, and
+        /// `timeoutIntervalForResource` is ``resourceTimeout``.
+        ///
+        /// Background mode only: `URLSessionConfiguration.background(withIdentifier:)` with the
+        /// stable identifier, `sessionSendsLaunchEvents` on, and `isDiscretionary` from
+        /// ``sessionNetworkAccess``'s ``NetworkPolicy/scheduling``: ``NetworkPolicy/Scheduling/userInitiated``
+        /// (the default, for downloads a person asked for) is non-discretionary,
+        /// ``NetworkPolicy/Scheduling/deferred`` lets the system postpone every task of the
+        /// session (for example until the device is charging on Wi-Fi). Discretion is a session
+        /// setting: one session cannot mix both, so a deferred item in a non-discretionary
+        /// session is only marked with the background network service type.
         func makeConfiguration(identifier: String) -> URLSessionConfiguration {
-            let configuration = URLSessionConfiguration.ephemeral
+            let configuration: URLSessionConfiguration
+            if mode == .background {
+                configuration = URLSessionConfiguration.background(withIdentifier: identifier)
+                configuration.sessionSendsLaunchEvents = true
+                configuration.isDiscretionary = sessionNetworkAccess.scheduling == .deferred
+            } else {
+                configuration = URLSessionConfiguration.ephemeral
+            }
             configuration.waitsForConnectivity = true
             configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
             configuration.urlCache = nil
+            configuration.httpCookieStorage = nil
+            configuration.urlCredentialStorage = nil
             configuration.allowsCellularAccess = sessionNetworkAccess.allowsCellular
             configuration.allowsExpensiveNetworkAccess = sessionNetworkAccess.allowsExpensive
             configuration.allowsConstrainedNetworkAccess = sessionNetworkAccess.allowsConstrained
+            configuration.timeoutIntervalForResource = resourceTimeout
             configure?(configuration)
             return configuration
         }
     }
 
     public let options: Options
-    private let registry = TransferHostRegistry()
+    private let registry: TransferHostRegistry
 
     public init(options: Options = Options()) {
         self.options = options
+        // Background sessions are process-wide; foreground sessions belong to this transport.
+        self.registry = options.mode == .background ? TransferHostRegistry.background : TransferHostRegistry()
     }
 
     public func makeSession(identifier: String, storageRoot: URL) async throws -> any TransferSession {
@@ -99,9 +150,10 @@ public struct URLSessionTransport: TransferSessionFactory {
         return URLSessionTransferSession(identifier: identifier, events: events, host: host)
     }
 
-    /// Ends every system session this transport created. Their event streams finish; a later
-    /// ``makeSession(identifier:storageRoot:)`` for the same identifier fails. With
-    /// `cancellingTasks` false, running transfers finish first.
+    /// Ends every system session this transport created (in background mode: every background
+    /// session of the package in this process). Their event streams finish; a later
+    /// ``makeSession(identifier:storageRoot:)`` for the same identifier fails in this process.
+    /// With `cancellingTasks` false, running transfers finish first.
     public func invalidate(cancellingTasks: Bool = false) async {
         await registry.invalidateAll(cancellingTasks: cancellingTasks)
     }
@@ -109,10 +161,17 @@ public struct URLSessionTransport: TransferSessionFactory {
     func host(for identifier: String) async -> TransferSessionHost? {
         await registry.existing(identifier)
     }
+
+    /// Whether this transport uses the process-wide registry of background sessions.
+    var usesProcessWideSessions: Bool { registry === TransferHostRegistry.background }
 }
 
-/// The hosts of one transport, one per session identifier.
+/// The hosts of one transport, one per session identifier. Background hosts live in one
+/// process-wide registry: the system allows a single session object per background identifier,
+/// and a later manager (after a detach) must reconnect to the same session and delegate.
 actor TransferHostRegistry {
+    static let background = TransferHostRegistry()
+
     private var hosts: [String: TransferSessionHost] = [:]
     private var invalidated: Set<String> = []
 

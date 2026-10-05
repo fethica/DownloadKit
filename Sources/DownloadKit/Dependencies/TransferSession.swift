@@ -9,7 +9,7 @@ import Foundation
 ///
 /// The production factory is ``URLSessionTransport``: delegate-based URLSession download tasks,
 /// synchronous capture of finished files into `staging/` and a durable inbox of terminal
-/// events. This version configures a foreground session only.
+/// events, in a foreground or a background session (``URLSessionTransport/Mode``).
 ///
 /// Ownership across managers: the factory, not the manager, owns the system session, its
 /// delegate and the inbox of events the delegate produced. A manager that detaches stops

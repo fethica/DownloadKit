@@ -28,9 +28,11 @@ public struct DownloadConfiguration: Sendable {
     /// the deadline even while an index write is suspended.
     public var reconciliationTimeout: TimeInterval
     /// The longest a background-wake completion handler waits for the wake's events to be
-    /// committed. When the index cannot be updated in time, the handler is called anyway and
-    /// the uncommitted events stay unacknowledged with the session, which delivers them again.
-    /// The budget holds even while an index write is suspended.
+    /// committed, counted from the first unanswered handler or wake marker the running manager
+    /// saw. When the index cannot be updated in time, or the marker does not come, the handler
+    /// is called anyway and the uncommitted events stay unacknowledged with the session, which
+    /// delivers them again. The budget holds even while an index write is suspended. Keep it
+    /// well below the time the system gives a background wake.
     public var backgroundWakeBudget: TimeInterval
     /// The time a finaliser is given to validate and rename one file. A finaliser that cannot
     /// finish by then defers; the capture stays and is finalised again later.
@@ -66,7 +68,7 @@ public struct DownloadConfiguration: Sendable {
 /// The injectable collaborators of a manager.
 ///
 /// Each one is a narrow protocol so tests can drive the manager with controlled events.
-/// Production adapters: ``URLSessionTransport`` (foreground only in this version),
+/// Production adapters: ``URLSessionTransport`` (foreground or background session),
 /// ``SQLiteIndexStore/opener(progressWriteInterval:clock:)``, ``LocalFileSystem``, ``SystemClock``
 /// and ``SystemJitter``. There is no production path source yet.
 public struct DownloadDependencies: Sendable {
