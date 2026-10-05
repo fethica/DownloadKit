@@ -450,6 +450,87 @@ final class SQLiteIndexStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appending("log").path))
     }
 
+    // MARK: Competing writers
+
+    /// Holds a write transaction on its own connection and thread: runs `changes` inside
+    /// `BEGIN IMMEDIATE`, then commits once the opener is about to ask for the write lock, after
+    /// `delay`, so the opener waits for the lock and acquires it only after that commit.
+    private final class CompetingWriter: Sendable {
+        private let ready = DispatchSemaphore(value: 0)
+        private let go = DispatchSemaphore(value: 0)
+        private let done = DispatchSemaphore(value: 0)
+
+        init(path: String, changes: String, delay: TimeInterval) {
+            let ready = self.ready, go = self.go, done = self.done
+            Thread {
+                var handle: OpaquePointer?
+                sqlite3_open(path, &handle)
+                sqlite3_busy_timeout(handle, 10_000)
+                sqlite3_exec(handle, "BEGIN IMMEDIATE; \(changes)", nil, nil, nil)
+                ready.signal()
+                go.wait()
+                Thread.sleep(forTimeInterval: delay)
+                sqlite3_exec(handle, "COMMIT", nil, nil, nil)
+                sqlite3_close(handle)
+                done.signal()
+            }.start()
+            ready.wait()
+        }
+
+        /// The opener's hook: lets the writer commit while the opener waits for the lock.
+        var release: @Sendable () -> Void { { [go] in go.signal() } }
+
+        func waitUntilCommitted() { done.wait() }
+    }
+
+    private func writeVersionOneIndex() async throws {
+        let store = try open()
+        try await store.apply(IndexChangeSet(upserts: everyShape(), nextGeneration: 10))
+        await store.close()
+        try rawExecute("UPDATE dk_schema SET version = 1")
+    }
+
+    func testNewerVersionCommittedWhileTheOpenerWaitsForTheLockIsRefused() async throws {
+        try await writeVersionOneIndex()
+        // Another process holds the write lock and raises the version to 3; the opener's
+        // read-only inspection still sees the committed version 1.
+        let writer = CompetingWriter(path: fileURL.path, changes: "UPDATE dk_schema SET version = 3;", delay: 0.3)
+        XCTAssertThrowsError(try SQLiteIndexStore(fileURL: fileURL, beforeWriterLock: writer.release)) { error in
+            XCTAssertEqual(error as? DownloadError, .unsupportedSchema(found: 3, supported: IndexSchema.currentVersion))
+        }
+        writer.waitUntilCommitted()
+        XCTAssertEqual(try rawStrings("SELECT CAST(version AS TEXT) FROM dk_schema"), ["3"], "the newer version is not overwritten")
+        XCTAssertEqual(try rawStrings("SELECT id FROM dk_records").count, everyShape().count)
+    }
+
+    func testRecordInvalidatedWhileTheOpenerWaitsForTheLockIsRefusedWithoutMigration() async throws {
+        try await writeVersionOneIndex()
+        try rawExecute("PRAGMA journal_mode = DELETE")
+        XCTAssertEqual(try Data(contentsOf: fileURL)[18], 1, "rollback-journal mode before")
+        // Another process makes a row disagree with its record after the inspection passed.
+        let writer = CompetingWriter(path: fileURL.path, changes: "UPDATE dk_records SET generation = 7 WHERE id = 'completed';", delay: 0.3)
+        XCTAssertThrowsError(try SQLiteIndexStore(fileURL: fileURL, beforeWriterLock: writer.release)) { error in
+            XCTAssertEqual(error as? DownloadError, .corruptIndex)
+        }
+        writer.waitUntilCommitted()
+        XCTAssertEqual(try rawStrings("SELECT CAST(version AS TEXT) FROM dk_schema"), ["1"], "nothing was migrated")
+        XCTAssertEqual(try Data(contentsOf: fileURL)[18], 1, "the journal mode was not switched to WAL")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path + "-wal"))
+        XCTAssertEqual(try rawStrings("SELECT CAST(generation AS TEXT) FROM dk_records WHERE id = 'completed'"), ["7"])
+    }
+
+    func testVersionOneIndexIsMigratedAfterAnUnrelatedWriterCommits() async throws {
+        try await writeVersionOneIndex()
+        let writer = CompetingWriter(path: fileURL.path, changes: "INSERT OR REPLACE INTO dk_globals (key, value) VALUES ('host_note', 1);", delay: 0.3)
+        let store = try SQLiteIndexStore(fileURL: fileURL, beforeWriterLock: writer.release)
+        writer.waitUntilCommitted()
+        let contents = try await store.load()
+        XCTAssertEqual(contents?.records.count, everyShape().count)
+        await store.close()
+        XCTAssertEqual(try rawStrings("SELECT CAST(version AS TEXT) FROM dk_schema"), ["\(IndexSchema.currentVersion)"])
+        XCTAssertEqual(try rawStrings("SELECT key FROM dk_globals WHERE key = 'host_note'"), ["host_note"], "unknown globals are kept")
+    }
+
     // MARK: Raw access
 
     private func rawExecute(_ sql: String) throws {

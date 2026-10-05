@@ -5,8 +5,8 @@
 //  The adapter's durable record of terminal events, on disk under
 //  `<root>/transfer/<session>/`:
 //  - `receipts/`: one file per terminal outcome, written synchronously inside the system
-//    callback right after the downloaded file was moved into `staging/`, before the callback
-//    returns. A receipt has no sequence number yet.
+//    callback before the downloaded file is moved into `staging/` (see the order below), and
+//    before the callback returns. A receipt has no sequence number yet.
 //  - `events/`: one file per sequenced terminal event, written before the event is delivered.
 //    A file is deleted once the manager acknowledged its sequence number.
 //  - `state.json`: the highest reserved sequence number, so numbers are never reused across

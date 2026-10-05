@@ -19,9 +19,13 @@ import SQLite3
 ///   a file that is not a database, a database without the version table, a populated index
 ///   without its required globals, a record that does not decode, contradicts itself or its row,
 ///   or whose generation is not below the stored counter throws ``DownloadError/corruptIndex``.
-///   Refusal writes nothing (no journal mode change, no schema creation). Only an empty database
-///   is treated as never written. A valid version 1 index is migrated to version 2 in one
-///   transaction (see ``IndexSchema``).
+///   Refusal writes nothing to the database (no journal mode change, no schema creation; on a
+///   WAL database the read can still create the `-shm` scratch file). Only an empty database
+///   is treated as never written. The writable connection then takes the write lock first and
+///   repeats every check inside that transaction, so a database another process changed in
+///   between (a newer version, an invalid record) is refused, not migrated or rewritten; a
+///   valid version 1 index is migrated to version 2 in that same transaction (see
+///   ``IndexSchema``), and only then does the journal mode switch to WAL.
 /// - The database file and its `-wal`, `-shm` and `-journal` companions must not be symbolic
 ///   links (checked with ``PathConfinement`` against their directory before opening); otherwise
 ///   opening throws ``DownloadError/storageUnavailable``. `SQLITE_OPEN_NOFOLLOW` is not used: it
@@ -59,10 +63,16 @@ public actor SQLiteIndexStore: DownloadIndexStore {
 
     /// Opens (or creates) the database at `fileURL`.
     ///
-    /// Throws ``DownloadError/storageUnavailable`` when the file cannot be opened,
+    /// Throws ``DownloadError/storageUnavailable`` when the file cannot be opened or locked,
     /// ``DownloadError/unsupportedSchema(found:supported:)`` for a newer schema and
-    /// ``DownloadError/corruptIndex`` for anything that is not a version 1 index.
+    /// ``DownloadError/corruptIndex`` for anything that is not a version 1 or 2 index.
     public init(fileURL: URL, progressWriteInterval: TimeInterval = 1, clock: any DownloadClock = SystemClock()) throws {
+        try self.init(fileURL: fileURL, progressWriteInterval: progressWriteInterval, clock: clock, beforeWriterLock: nil)
+    }
+
+    /// `beforeWriterLock` runs on the writable connection just before it asks for the write lock
+    /// (tests only: it lets another connection commit while the opener waits for that lock).
+    init(fileURL: URL, progressWriteInterval: TimeInterval = 1, clock: any DownloadClock = SystemClock(), beforeWriterLock: (@Sendable () -> Void)?) throws {
         self.progressWriteInterval = max(0, progressWriteInterval)
         self.clock = clock
         try Self.checkConfinement(of: fileURL)
@@ -73,6 +83,7 @@ public actor SQLiteIndexStore: DownloadIndexStore {
             // even a journal mode change.
             try Self.inspect(Connection(try Self.openDatabase(at: fileURL, flags: SQLITE_OPEN_READONLY)))
             connection = Connection(try Self.openDatabase(at: fileURL, flags: SQLITE_OPEN_READWRITE))
+            beforeWriterLock?()
             try Self.prepareExisting(connection.handle)
         } else {
             connection = Connection(try Self.openDatabase(at: fileURL, flags: SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE))
@@ -303,17 +314,43 @@ public actor SQLiteIndexStore: DownloadIndexStore {
         return true
     }
 
-    /// Opens a database that passed ``inspect(_:)``: creates the schema if it had no table,
-    /// migrates version 1 to the current version, then switches to WAL. The checks run again on
-    /// this connection, so nothing is written to a database that changed in between.
+    /// Opens a database that passed ``inspect(_:)``. The read-only inspection is advisory: the
+    /// database may have changed since. So the write lock is taken first (`BEGIN IMMEDIATE`), and
+    /// inside that one transaction the tables, the version and every record are checked again
+    /// before anything is written: a table-less database gets the schema, a valid version 1 index
+    /// is migrated, the current version is left as it is, and anything else rolls back and throws
+    /// its typed error. Only after the commit does the journal mode switch to WAL.
     private static func prepareExisting(_ database: OpaquePointer) throws {
-        guard try checkSchema(database) else {
-            try prepareSchema(database)
-            return
+        do {
+            try execute(database, "BEGIN IMMEDIATE")
+        } catch let failure as SQLiteFailure {
+            throw failure.loadError
         }
-        let versions = (try? integers(database, "SELECT version FROM dk_schema")) ?? []
-        if let version = versions.max(), version < Int64(IndexSchema.currentVersion) {
-            try migrate(database)
+        do {
+            if try checkSchema(database) {
+                let version: Int64
+                do {
+                    guard let stored = try integers(database, "SELECT version FROM dk_schema").max() else { throw DownloadError.corruptIndex }
+                    version = stored
+                } catch let failure as SQLiteFailure {
+                    throw failure.loadError
+                }
+                _ = try readContents(database)
+                if version < Int64(IndexSchema.currentVersion) {
+                    try migrate(database)
+                }
+            } else {
+                try createTables(database)
+            }
+            do {
+                try execute(database, "COMMIT")
+            } catch let failure as SQLiteFailure {
+                throw failure.loadError
+            }
+        } catch {
+            try? execute(database, "ROLLBACK")
+            if let error = error as? DownloadError { throw error }
+            throw DownloadError.storageUnavailable
         }
         do {
             try execute(database, "PRAGMA journal_mode = WAL")
@@ -327,17 +364,24 @@ public actor SQLiteIndexStore: DownloadIndexStore {
     /// (``IndexRecord/stoppedWhileUnconfirmed``, ``IndexRecord/restartDeferred``,
     /// ``IndexRecord/policyChangeDeferred``) that version 1 never wrote and that decode as false.
     /// The version is raised so a version 1 build refuses the index instead of dropping those
-    /// fields when it rewrites a record. Idempotent: one transaction, re-run if interrupted.
+    /// fields when it rewrites a record. Runs inside the caller's write transaction, after the
+    /// contents were validated in it; re-run if interrupted.
     private static func migrate(_ database: OpaquePointer) throws {
         do {
-            try execute(database, "BEGIN IMMEDIATE")
             try execute(database, "DELETE FROM dk_schema")
             try execute(database, "INSERT INTO dk_schema (version) VALUES (\(IndexSchema.currentVersion))")
-            try execute(database, "COMMIT")
         } catch {
-            try? execute(database, "ROLLBACK")
             throw DownloadError.storageUnavailable
         }
+    }
+
+    /// The current schema's tables, inside the caller's transaction.
+    private static func createTables(_ database: OpaquePointer) throws {
+        try execute(database, "CREATE TABLE dk_schema (version INTEGER NOT NULL)")
+        try execute(database, "INSERT INTO dk_schema (version) VALUES (\(IndexSchema.currentVersion))")
+        try execute(database, "CREATE TABLE dk_globals (key TEXT PRIMARY KEY NOT NULL, value BLOB) WITHOUT ROWID")
+        try execute(database, "CREATE TABLE dk_records (id TEXT PRIMARY KEY NOT NULL, generation INTEGER NOT NULL, journal TEXT NOT NULL, record BLOB NOT NULL) WITHOUT ROWID")
+        try execute(database, "CREATE TABLE dk_cleanup (path TEXT PRIMARY KEY NOT NULL) WITHOUT ROWID")
     }
 
     /// Creates the current schema in a database without tables, then switches to WAL.
@@ -345,11 +389,7 @@ public actor SQLiteIndexStore: DownloadIndexStore {
         do {
             try execute(database, "PRAGMA journal_mode = WAL")
             try execute(database, "BEGIN IMMEDIATE")
-            try execute(database, "CREATE TABLE dk_schema (version INTEGER NOT NULL)")
-            try execute(database, "INSERT INTO dk_schema (version) VALUES (\(IndexSchema.currentVersion))")
-            try execute(database, "CREATE TABLE dk_globals (key TEXT PRIMARY KEY NOT NULL, value BLOB) WITHOUT ROWID")
-            try execute(database, "CREATE TABLE dk_records (id TEXT PRIMARY KEY NOT NULL, generation INTEGER NOT NULL, journal TEXT NOT NULL, record BLOB NOT NULL) WITHOUT ROWID")
-            try execute(database, "CREATE TABLE dk_cleanup (path TEXT PRIMARY KEY NOT NULL) WITHOUT ROWID")
+            try createTables(database)
             try execute(database, "COMMIT")
         } catch {
             try? execute(database, "ROLLBACK")
