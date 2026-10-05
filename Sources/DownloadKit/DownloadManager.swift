@@ -17,8 +17,9 @@ import Foundation
 /// 3. Send commands. Every command and every transfer event is applied in arrival order, one
 ///    at a time: the index is written before in-memory state changes and before any transfer
 ///    is started or cancelled.
-/// 4. Forward the app delegate's background-session wake to
-///    ``handleBackgroundEvents(forSession:completionHandler:)``. It may be called before
+/// 4. Forward the app delegate's background-session wake to a ``BackgroundTransferEvents``
+///    passed at creation (it accepts the wake even before the manager exists), or to
+///    ``handleBackgroundEvents(forSession:completionHandler:)``, which may be called before
 ///    ``start()`` finishes.
 /// 5. ``detach()`` releases the in-process owner without cancelling transfers.
 ///
@@ -41,14 +42,18 @@ public final class DownloadManager: Sendable {
     /// Creates a manager. Captured files are finalised by the package's validating finaliser
     /// (evidence, length, content, optional checksum, then an atomic rename), using the
     /// configuration's file system and clock.
-    public convenience init(configuration: DownloadConfiguration, urlRefresher: (any URLRefreshing)? = nil) {
+    ///
+    /// `backgroundEvents` is the host's relaunch receiver. When it accepts this manager's
+    /// ``DownloadConfiguration/sessionIdentifier``, handlers it received (before or after this
+    /// manager was created) are answered by this manager; otherwise the manager keeps its own.
+    public convenience init(configuration: DownloadConfiguration, urlRefresher: (any URLRefreshing)? = nil, backgroundEvents: BackgroundTransferEvents? = nil) {
         let dependencies = configuration.dependencies
-        self.init(configuration: configuration, urlRefresher: urlRefresher, finalizer: FileFinalizer(fileSystem: dependencies.fileSystem, clock: dependencies.clock))
+        self.init(configuration: configuration, urlRefresher: urlRefresher, finalizer: FileFinalizer(fileSystem: dependencies.fileSystem, clock: dependencies.clock), backgroundEvents: backgroundEvents)
     }
 
-    init(configuration: DownloadConfiguration, urlRefresher: (any URLRefreshing)?, finalizer: any DownloadFinalizing) {
+    init(configuration: DownloadConfiguration, urlRefresher: (any URLRefreshing)?, finalizer: any DownloadFinalizing, backgroundEvents relay: BackgroundTransferEvents? = nil) {
         self.configuration = configuration
-        let backgroundEvents = BackgroundEventsCoordinator()
+        let backgroundEvents = relay?.coordinator(for: configuration.sessionIdentifier) ?? BackgroundEventsCoordinator()
         self.backgroundEvents = backgroundEvents
         self.engine = DownloadEngine(configuration: configuration, urlRefresher: urlRefresher, finalizer: finalizer, backgroundEvents: backgroundEvents, host: host)
     }
@@ -83,11 +88,13 @@ public final class DownloadManager: Sendable {
 
     /// Accepts the host's background-session wake.
     ///
-    /// Call it from `application(_:handleEventsForBackgroundURLSession:completionHandler:)`.
-    /// Returns `false`, without keeping the handler, when `identifier` is not this manager's
-    /// session identifier; the host stays responsible for it. Otherwise the handler is kept
-    /// (even before ``start()`` finished) and called exactly once on the main actor after the
-    /// manager has applied every event the system delivered for the wake.
+    /// Call it from `application(_:handleEventsForBackgroundURLSession:completionHandler:)`
+    /// when the manager already exists; a ``BackgroundTransferEvents`` also covers a wake that
+    /// arrives before it. Returns `false`, without keeping the handler, when `identifier` is not
+    /// this manager's session identifier; the host stays responsible for it. Otherwise the
+    /// handler is kept (even before ``start()`` finished) and called exactly once on the main
+    /// actor after the manager has applied every event the system delivered for the wake, or
+    /// at ``DownloadConfiguration/backgroundWakeBudget`` (see ``BackgroundTransferEvents``).
     @MainActor
     @discardableResult
     public func handleBackgroundEvents(forSession identifier: String, completionHandler: @escaping () -> Void) -> Bool {

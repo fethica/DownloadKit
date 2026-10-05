@@ -191,6 +191,7 @@ actor DownloadEngine {
             lifecycle = .running
             await reconcile()
             startConsumers()
+            await attachBackgroundEvents()
         } catch {
             teardown()
             await releaseClaimIfHeld()
@@ -716,6 +717,9 @@ actor DownloadEngine {
         if let applied, let session { await session.acknowledge(through: applied) }
         if hasUnservicedWakeMarker {
             await armWakeBudget()
+        } else if await hasWaitingWakeHandler() {
+            // A handler whose marker has not come (or came before it): the budget releases it.
+            await armWakeBudget()
         } else {
             wakeTimer?.cancel()
             wakeTimer = nil
@@ -749,6 +753,21 @@ actor DownloadEngine {
         }
     }
 
+    /// Connects the host's wake handlers: one already waiting (forwarded before start) arms
+    /// the wake budget now, and every later one arms it when it arrives.
+    private func attachBackgroundEvents() async {
+        guard let backgroundEvents else { return }
+        let waiting = await backgroundEvents.attach { [weak self] in
+            Task { await self?.wakeHandlerArrived() }
+        }
+        if waiting > 0 { await armWakeBudget() }
+    }
+
+    private func wakeHandlerArrived() async {
+        guard lifecycle == .running else { return }
+        await armWakeBudget()
+    }
+
     private var hasUnservicedWakeMarker: Bool {
         inbox.contains { envelope in
             guard case .backgroundEventsFinished = envelope.payload else { return false }
@@ -771,10 +790,17 @@ actor DownloadEngine {
         }
     }
 
-    /// The wake budget passed while its events could not be committed. Runs outside the chain,
-    /// so a step stuck on the index cannot hold the host's handler: the handler is released
-    /// now, and the uncommitted events stay unacknowledged with the session, which keeps them
-    /// durably and delivers them again. When the marker is applied later it calls nothing.
+    private func hasWaitingWakeHandler() async -> Bool {
+        guard let backgroundEvents else { return false }
+        return await backgroundEvents.pendingHandlerCount > 0
+    }
+
+    /// The wake budget passed while its events could not be committed, or while a handler
+    /// still waits for a marker that has not come. Runs outside the chain, so a step stuck on
+    /// the index cannot hold the host's handler: the handlers are released now, and the
+    /// uncommitted events stay unacknowledged with the session, which keeps them durably and
+    /// delivers them again. A marker already received is then serviced: applying it later calls
+    /// nothing.
     private func wakeBudgetExpired() async {
         wakeTimer = nil
         guard lifecycle == .running else { return }
@@ -784,6 +810,7 @@ actor DownloadEngine {
             servicedWakeMarkers.insert(envelope.sequence)
             released = true
         }
+        if !released { released = await hasWaitingWakeHandler() }
         if released, let backgroundEvents { await backgroundEvents.eventsApplied() }
     }
 
