@@ -60,7 +60,7 @@ public struct IndexRecord: Hashable, Sendable, Codable {
     public internal(set) var integrity: IntegrityRecord?
     public internal(set) var journal: FinalizationJournal
     public internal(set) var stagingPath: RelativePath?
-    /// Where the finaliser renames the captured file: `media/item-<generation>` of the
+    /// Where the finaliser renames the captured file: `media/item-<generation>[.ext]` of the
     /// capturing attempt. Written in the same commit as the capture, before any rename, and
     /// kept until the completion commits or the file is cleaned up, so a file the finaliser
     /// may create is always owned by this record, including while it is being removed.
@@ -246,14 +246,22 @@ public struct TaskBinding: Hashable, Sendable, Codable {
     }
 }
 
-/// HTTP validators of the response that produced the bytes.
+/// Evidence from the response that produced the bytes: its HTTP validators, status and media
+/// type. Kept with the capture so finalisation can check it again and a later attempt can
+/// compare validators.
 public struct ResponseValidators: Hashable, Sendable, Codable {
     public var entityTag: String?
     public var lastModified: String?
+    /// The final HTTP status (200, or 206 for a completed range continuation).
+    public var statusCode: Int?
+    /// The declared media type, lowercased, without parameters.
+    public var mediaType: String?
 
-    public init(entityTag: String? = nil, lastModified: String? = nil) {
+    public init(entityTag: String? = nil, lastModified: String? = nil, statusCode: Int? = nil, mediaType: String? = nil) {
         self.entityTag = entityTag
         self.lastModified = lastModified
+        self.statusCode = statusCode
+        self.mediaType = mediaType
     }
 }
 
@@ -278,8 +286,9 @@ public struct IntegrityRecord: Hashable, Sendable, Codable {
 ///    ``IndexRecord/finalizationDestination``) is committed with the record. Until that
 ///    commit the transfer session keeps the unacknowledged event and delivers it again after
 ///    a relaunch, so the capture never loses its association.
-/// 2. The finaliser validates length and checksum, flushes the file and renames it to the
-///    deterministic destination ``RelativePath`` `media/item-<generation>`. These steps are
+/// 2. The finaliser validates the response evidence, length, content and checksum, flushes the
+///    file and renames it to the deterministic destination `media/item-<generation>`, with an
+///    allowlisted extension when the response declared a known media type. These steps are
 ///    not journaled separately: they are idempotent, and a finaliser that finds the staging
 ///    file gone and a valid file at the destination reports it as finalised.
 /// 3. ``committed``: the completed record was committed; only now is the item completed.

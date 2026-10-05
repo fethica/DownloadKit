@@ -7,9 +7,9 @@ import Foundation
 
 /// Creates the transfer session a manager owns.
 ///
-/// The production adapter will wrap one background `URLSession` per session identifier, its
-/// delegate and the synchronous capture of finished files into `staging/`. That adapter is
-/// not implemented yet; until it is, a host must supply its own factory.
+/// The production factory is ``URLSessionTransport``: delegate-based URLSession download tasks,
+/// synchronous capture of finished files into `staging/` and a durable inbox of terminal
+/// events. This version configures a foreground session only.
 ///
 /// Ownership across managers: the factory, not the manager, owns the system session, its
 /// delegate and the inbox of events the delegate produced. A manager that detaches stops
