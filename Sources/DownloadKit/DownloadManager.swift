@@ -36,6 +36,7 @@ public final class DownloadManager: Sendable {
     public let configuration: DownloadConfiguration
     let engine: DownloadEngine
     private let backgroundEvents: BackgroundEventsCoordinator
+    private let host = EngineHost()
 
     public convenience init(configuration: DownloadConfiguration, urlRefresher: (any URLRefreshing)? = nil) {
         self.init(configuration: configuration, urlRefresher: urlRefresher, finalizer: DeferredFinalizer())
@@ -45,7 +46,7 @@ public final class DownloadManager: Sendable {
         self.configuration = configuration
         let backgroundEvents = BackgroundEventsCoordinator()
         self.backgroundEvents = backgroundEvents
-        self.engine = DownloadEngine(configuration: configuration, urlRefresher: urlRefresher, finalizer: finalizer, backgroundEvents: backgroundEvents)
+        self.engine = DownloadEngine(configuration: configuration, urlRefresher: urlRefresher, finalizer: finalizer, backgroundEvents: backgroundEvents, host: host)
     }
 
     // MARK: Lifecycle
@@ -64,10 +65,13 @@ public final class DownloadManager: Sendable {
     /// Transfers already handed to the system are not cancelled, and session events not yet
     /// applied stay with the session for the next owner.
     ///
-    /// The storage claim is freed immediately when no ``LocalFileLease`` is outstanding.
-    /// Otherwise it is kept until the last lease ends, so another manager cannot take over the
-    /// root and delete a file that is still leased. A detached manager never deletes files; the
-    /// next owner finishes pending removals when it starts.
+    /// Returns once no file worker of this manager is running any more: a finaliser in flight
+    /// is an ownership claim on the root, so detach waits for it to return (a finaliser defers
+    /// at ``DownloadConfiguration/finalizationBudget``). The storage claim is then freed when no
+    /// ``LocalFileLease`` is outstanding; otherwise it is kept until the last lease ends, so
+    /// another manager cannot take over the root and delete a file that is still leased. A
+    /// detached manager never deletes files; the next owner finishes pending removals when it
+    /// starts.
     public func detach() async {
         await engine.detach()
     }
@@ -92,9 +96,27 @@ public final class DownloadManager: Sendable {
     /// also runs at the start of every later command.
     ///
     /// Throws ``DownloadError/persistenceFailed`` while events are still waiting for an index
-    /// write. A file deletion that keeps failing leaves the item `removing`.
+    /// write. A file deletion that keeps failing leaves the item `removing`, or its deletion
+    /// intent queued in the index. When start-up reconciliation timed out, this also looks for
+    /// the missing tasks again and throws ``DownloadError/reconciliationUnresolved`` while some
+    /// are still unaccounted for; their intent and bytes are kept.
     public func flushPendingWork() async throws {
         try await engine.flushPendingWork()
+    }
+
+    /// Where start-up reconciliation stands. See ``ReconciliationStatus``.
+    public func reconciliationStatus() async -> ReconciliationStatus {
+        await engine.reconciliationStatus()
+    }
+
+    /// Files under `staging/` and `media/` that no record owns and no queued deletion names,
+    /// for example after an interrupted migration or a crash in an adapter. They are reported,
+    /// never deleted automatically.
+    ///
+    /// Throws ``DownloadError/notStarted`` before start and ``DownloadError/storageUnavailable``
+    /// when a directory cannot be listed.
+    public func unreferencedFiles() async throws -> [RelativePath] {
+        try await engine.unreferencedFiles()
     }
 
     // MARK: Commands
@@ -199,8 +221,12 @@ public final class DownloadManager: Sendable {
 
     /// Ends a lease returned by ``localFile(for:)``. A pending removal completes when the last
     /// lease of the item ends.
+    ///
+    /// The lease is ended by the manager that issued it, whichever manager this is called on,
+    /// so a lease that outlived its (detached or released) manager can be ended through its
+    /// successor. Ending a lease twice does nothing.
     public func endAccess(_ lease: LocalFileLease) async {
-        await engine.endAccess(lease)
+        await lease.owner.endAccess(lease)
     }
 
     /// Runs `body` with a validated local file URL, holding a lease for its duration.

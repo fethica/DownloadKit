@@ -14,7 +14,8 @@ import Foundation
 /// A lease keeps its manager's ownership of the storage root alive: after
 /// ``DownloadManager/detach()``, or after the manager itself is released, no other manager can
 /// claim the root until every lease has ended, so no other owner can delete a leased file.
-/// Copies of a lease are the same lease.
+/// ``DownloadManager/endAccess(_:)`` always ends the lease at the manager that issued it, so a
+/// successor manager can end it. Copies of a lease are the same lease.
 public struct LocalFileLease: Hashable, Sendable {
     public let id: DownloadID
     /// The absolute file URL, valid until the lease ends.

@@ -53,4 +53,7 @@ public enum DownloadError: Error, Hashable, Sendable {
     case fileAccessFailed(DownloadID)
     /// A stored record passed to ``IndexRecord`` has contradictory fields.
     case invalidStoredRecord(DownloadID)
+    /// Start-up reconciliation could not prove what happened to some attempts; see
+    /// ``ReconciliationStatus/unresolved(items:reason:)``. Their intent and bytes are kept.
+    case reconciliationUnresolved
 }

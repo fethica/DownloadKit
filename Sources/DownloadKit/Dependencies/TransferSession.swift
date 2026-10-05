@@ -37,18 +37,33 @@ public protocol TransferSession: Sendable {
     ///
     /// Delivery contract:
     /// - Sequence numbers strictly increase.
+    /// - An event keeps its identity, including its sequence number, when it is delivered
+    ///   again: to a later session object for the same identifier, and after a relaunch. A
+    ///   replay is the same event, never a renumbered copy. (The manager does not depend on
+    ///   this for correctness, because it accepts one capture per attempt, but an
+    ///   acknowledgement watermark is only meaningful under it.)
     /// - Terminal events (``TransferEvent/finished(_:captured:bytes:validators:)``,
     ///   ``TransferEvent/failed(_:_:)``, ``TransferEvent/resumeDataCaptured(_:_:)``) are
     ///   never dropped. An event that was not acknowledged with ``acknowledge(through:)``
     ///   before the process ended is delivered again after reconnection, so a captured file
     ///   never loses its association with its task.
     /// - Progress and waiting events are advisory: they may be coalesced or dropped.
-    /// - ``TransferSessionEvent/Payload/backlogDelivered`` is sent once per session object,
-    ///   after every event that was pending when the session was created or reconnected.
-    /// - ``TransferSessionEvent/Payload/backgroundEventsFinished`` is sent after the system
-    ///   reports that it delivered all events of a background wake.
+    /// - ``TransferSessionEvent/Payload/backlogDelivered`` is the reconciliation fence: sent
+    ///   once per session object, after every event that was pending when the session was
+    ///   created or reconnected, covering both the adapter's durable inbox of captured files
+    ///   and every system callback queued before it. A task list snapshot alone is not that
+    ///   proof. Until the fence (or a wake's drain marker) arrives, the manager never decides
+    ///   that an expected task is gone; after ``DownloadConfiguration/reconciliationTimeout``
+    ///   it reports ``ReconciliationStatus/unresolved(items:reason:)`` and still creates no
+    ///   replacement.
+    /// - ``TransferSessionEvent/Payload/backgroundEventsFinished`` is sent from the system's
+    ///   wake-drained callback, after it delivered all events of a background wake. It is also
+    ///   a drain boundary for reconciliation. If the wake's events cannot be committed within
+    ///   ``DownloadConfiguration/backgroundWakeBudget``, the host's handler is called anyway
+    ///   and the events stay unacknowledged; the session must keep them durably (captured
+    ///   files in `staging/`, events in its inbox) and deliver them again.
     /// - The stream finishes only when the session is invalidated. The manager then stops
-    ///   ingesting; unresolved reconciliation waits for the next start.
+    ///   ingesting; unresolved reconciliation is reported and waits for the next start.
     var events: AsyncStream<TransferSessionEvent> { get }
 
     /// Creates a task for `submission` and returns its task identifier. The policy is

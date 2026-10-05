@@ -288,11 +288,11 @@ final class DownloadManagerRecoveryTests: XCTestCase {
     // MARK: interrupted stops
 
     func testPauseInterruptedBeforeCancellationIsEnforcedOnRestart() async throws {
-        var machine = DownloadStateMachine.fresh()
+        let sessionIdentifier = Harness.uniqueName("session")
+        var machine = DownloadStateMachine.fresh(session: sessionIdentifier)
         let generation = try machine.enqueueAndBind("a", task: 101)
         _ = try machine.handle(.pause(itemID("a")), now: referenceDate)
         let store = InMemoryIndexStore(contents: contents(of: machine))
-        let sessionIdentifier = Harness.uniqueName("session")
         let session = FakeTransferSession(identifier: sessionIdentifier, liveTasks: [reference("a", generation: generation, task: 101)])
 
         let manager = try Harness(sessionIdentifier: sessionIdentifier, store: store, session: session).makeManager()
@@ -307,11 +307,11 @@ final class DownloadManagerRecoveryTests: XCTestCase {
     }
 
     func testRemovalInterruptedBeforeCancellationCancelsTheOldTaskThenFinishes() async throws {
-        var machine = DownloadStateMachine.fresh()
+        let sessionIdentifier = Harness.uniqueName("session")
+        var machine = DownloadStateMachine.fresh(session: sessionIdentifier)
         let generation = try machine.enqueueAndBind("a", task: 101)
         _ = try machine.handle(.remove(itemID("a")), now: referenceDate)
         let store = InMemoryIndexStore(contents: contents(of: machine))
-        let sessionIdentifier = Harness.uniqueName("session")
         let session = FakeTransferSession(identifier: sessionIdentifier, liveTasks: [reference("a", generation: generation, task: 101)])
 
         let manager = try Harness(sessionIdentifier: sessionIdentifier, store: store, session: session).makeManager()

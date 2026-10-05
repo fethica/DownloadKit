@@ -21,6 +21,9 @@ struct FinalizationRequest: Sendable, Equatable {
     let validators: ResponseValidators?
     let expectedLength: Int64?
     let checksum: ContentChecksum?
+    /// The validation budget: a finaliser that cannot finish by this time (on the manager's
+    /// clock) returns ``FinalizationResult/deferred`` instead of running on.
+    let deadline: Date
 }
 
 enum FinalizationResult: Sendable, Equatable {
@@ -35,12 +38,18 @@ enum FinalizationResult: Sendable, Equatable {
 
 /// Finalisation contract:
 /// - runs outside the manager's command chain; its result is applied only if the record is
-///   still at the same generation with the same capture;
+///   still at the same generation with the same capture, and publishes a completion only if
+///   no pause or cancel was committed first;
+/// - creates no file except ``FinalizationRequest/destination``, which the record owns from
+///   the capture commit on; the manager treats a running finaliser as an ownership claim:
+///   removal deletes the item's files, and detach releases the storage root, only after the
+///   finaliser returned;
 /// - is idempotent: when the staging file is gone and ``FinalizationRequest/destination``
 ///   holds a file that validates, it reports ``FinalizationResult/finalized(finalPath:integrity:)``;
 /// - reads files in bounded chunks through ``DownloadFileSystem/readBytes(at:offset:maximumLength:)``
 ///   and flushes with ``DownloadFileSystem/synchronizeFile(at:)`` before renaming;
-/// - returns ``FinalizationResult/deferred`` instead of running past a wake budget.
+/// - returns ``FinalizationResult/deferred`` instead of running past
+///   ``FinalizationRequest/deadline``.
 protocol DownloadFinalizing: Sendable {
     func finalize(_ request: FinalizationRequest) async -> FinalizationResult
 }

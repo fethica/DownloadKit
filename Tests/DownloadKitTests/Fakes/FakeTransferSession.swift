@@ -5,7 +5,8 @@ import Foundation
 ///
 /// Live tasks carry the durable description the manager asked for, so reconciliation maps
 /// them exactly as it would map system tasks. Events are sequence-numbered; a backlog given
-/// at creation is delivered first, followed by the backlog marker.
+/// at creation is delivered first, followed by the backlog marker unless the session is told
+/// to withhold it (a compliant session whose marker is late).
 actor FakeTransferSession: TransferSession {
     struct Cancellation: Equatable {
         let taskIdentifier: Int
@@ -31,6 +32,7 @@ actor FakeTransferSession: TransferSession {
         liveTasks: [TransferTaskReference] = [],
         unmappedTasks: [SystemTransferTask] = [],
         backlog: [TransferEvent] = [],
+        deliversBacklogMarker: Bool = true,
         log: CallLog? = nil
     ) {
         self.identifier = identifier
@@ -45,9 +47,16 @@ actor FakeTransferSession: TransferSession {
             sequence += 1
             continuation.yield(TransferSessionEvent(sequence: sequence, payload: .transfer(event)))
         }
-        sequence += 1
-        continuation.yield(TransferSessionEvent(sequence: sequence, payload: .backlogDelivered))
+        if deliversBacklogMarker {
+            sequence += 1
+            continuation.yield(TransferSessionEvent(sequence: sequence, payload: .backlogDelivered))
+        }
         self.nextSequence = sequence
+    }
+
+    /// Adds a task the system reports (for example one whose number was reused).
+    func addSystemTask(_ task: TransferTaskReference) {
+        liveTasks.append(task)
     }
 
     func setSubmitFailure(_ failure: TransferFailure?) {

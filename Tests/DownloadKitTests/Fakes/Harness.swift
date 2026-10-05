@@ -28,6 +28,9 @@ struct Harness {
         snapshotInterval: TimeInterval = 0,
         retryPolicy: RetryPolicy = .default,
         jitter: Double = 0.5,
+        reconciliationTimeout: TimeInterval = 20,
+        backgroundWakeBudget: TimeInterval = 20,
+        finalizationBudget: TimeInterval = 15,
         failingTransport: Bool = false
     ) throws {
         let store = store ?? InMemoryIndexStore(log: log)
@@ -46,6 +49,9 @@ struct Harness {
             sessionIdentifier: sessionIdentifier,
             retryPolicy: retryPolicy,
             snapshotInterval: snapshotInterval,
+            reconciliationTimeout: reconciliationTimeout,
+            backgroundWakeBudget: backgroundWakeBudget,
+            finalizationBudget: finalizationBudget,
             dependencies: DownloadDependencies(
                 transport: FakeTransferSessionFactory(session: session, fails: failingTransport),
                 makeIndexStore: { _ in store },

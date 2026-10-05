@@ -1,0 +1,524 @@
+//
+//  DownloadManagerOwnershipTests.swift
+//  DownloadKitTests
+//
+//  Restart with an initially allowed path, file workers as ownership claims, leases ended
+//  through a successor, replay before recovered finalisation, exact stop identity, the
+//  reconciliation fence and wake budget, persisted cleanup intent and the completion/stop
+//  linearisation point.
+//
+
+import XCTest
+@testable import DownloadKit
+
+final class DownloadManagerOwnershipTests: XCTestCase {
+
+    private let cellular = NetworkPathStatus(isSatisfied: true, isExpensive: true, usesCellular: true)
+    private let wifi = NetworkPathStatus(isSatisfied: true)
+
+    private func contents(of machine: DownloadStateMachine) -> IndexContents {
+        IndexContents(nextGeneration: machine.nextGeneration, records: Array(machine.records.values), cleanupPaths: Array(machine.cleanup))
+    }
+
+    private func restart(_ first: Harness, session: FakeTransferSession? = nil) throws -> Harness {
+        try Harness(namespace: first.namespace, sessionIdentifier: first.sessionIdentifier, fileSystem: first.fileSystem, store: first.store, session: session)
+    }
+
+    /// An item whose intent was committed while the policy refused the path; its task binding
+    /// was never written.
+    private func unboundWaitingIndex(session: String) throws -> (InMemoryIndexStore, UInt64) {
+        var machine = DownloadStateMachine.fresh(session: session)
+        _ = machine.handle(.pathChanged(cellular), now: referenceDate, jitter: 0)
+        _ = try machine.handle(.enqueue(makeRequest("a")), now: referenceDate)
+        XCTAssertEqual(machine.phase("a"), .waiting(.networkPolicy))
+        XCTAssertNil(machine.record("a")?.binding)
+        return (InMemoryIndexStore(contents: contents(of: machine)), machine.generation("a"))
+    }
+
+    /// A captured, not yet finalised item, as saved before the session's event was acknowledged.
+    private func capturedIndex(session: String) throws -> (InMemoryIndexStore, TransferEvent, UInt64) {
+        var machine = DownloadStateMachine.fresh(session: session)
+        let generation = try machine.enqueueAndBind("a")
+        let finished = TransferEvent.finished(reference("a", generation: generation), captured: path("staging/x"), bytes: 10, validators: nil)
+        _ = machine.send(finished)
+        return (InMemoryIndexStore(contents: contents(of: machine)), finished, generation)
+    }
+
+    /// Starts `a`, delivers its completion and waits until the finaliser is suspended.
+    private func suspendFinalisation(_ harness: Harness, manager: DownloadManager, gate: FakeFinalizer.Gate) async throws -> TransferTaskReference {
+        try await manager.enqueue(makeRequest("a"))
+        let reference = try await XCTUnwrapAsync(await harness.session.latestReference(for: itemID("a")))
+        let captured = path("staging/a")
+        await harness.fileSystem.putFile(harness.url(captured), size: 10)
+        await harness.finalizer.setGate(gate)
+        await harness.session.emit(.finished(reference, captured: captured, bytes: 10, validators: nil))
+        await eventually("finaliser suspended") { await harness.finalizer.suspendedCount == 1 }
+        return reference
+    }
+
+    // MARK: restart with an initially allowed path
+
+    func testInitiallyAllowedPathAdoptsTheLiveTaskInsteadOfReplacingIt() async throws {
+        let sessionIdentifier = Harness.uniqueName("session")
+        let (store, generation) = try unboundWaitingIndex(session: sessionIdentifier)
+        let session = FakeTransferSession(identifier: sessionIdentifier, liveTasks: [reference("a", generation: generation, task: 55)])
+        let harness = try Harness(sessionIdentifier: sessionIdentifier, store: store, session: session, pathSource: FakePathSource(wifi))
+        let manager = harness.makeManager()
+
+        try await manager.start()
+        await eventually("backlog applied") { await session.acknowledged == 1 }
+
+        let submissions = await session.submissions
+        let cancellations = await session.cancellations
+        let stored = await store.contents?.records.first
+        let state = await manager.state(for: itemID("a"))
+        XCTAssertTrue(submissions.isEmpty, "the allowed path never replaces an attempt whose task may exist")
+        XCTAssertTrue(cancellations.isEmpty)
+        XCTAssertEqual(stored?.generation, generation)
+        XCTAssertEqual(stored?.binding?.taskIdentifier, 55)
+        XCTAssertEqual(state, .queued)
+    }
+
+    func testInitiallyAllowedPathAppliesTheBufferedCompletionInsteadOfReplacingIt() async throws {
+        let sessionIdentifier = Harness.uniqueName("session")
+        let (store, generation) = try unboundWaitingIndex(session: sessionIdentifier)
+        let captured = path("staging/buffered")
+        let session = FakeTransferSession(identifier: sessionIdentifier, backlog: [.finished(reference("a", generation: generation, task: 55), captured: captured, bytes: 10, validators: nil)])
+        let harness = try Harness(sessionIdentifier: sessionIdentifier, store: store, session: session, pathSource: FakePathSource(wifi))
+        await harness.fileSystem.putFile(harness.url(captured), size: 10)
+        let manager = harness.makeManager()
+
+        try await manager.start()
+        await eventually("buffered completion applied") { await manager.state(for: itemID("a")) == .completed(at: referenceDate) }
+
+        let submissions = await session.submissions
+        let finalExists = await harness.fileSystem.hasFile(harness.url(.media(generation: generation)))
+        XCTAssertTrue(submissions.isEmpty)
+        XCTAssertTrue(finalExists, "the buffered capture was finalised, not deleted as stale")
+    }
+
+    // MARK: file workers as ownership claims
+
+    func testRemovalBeforeRenameWaitsForTheFinaliser() async throws {
+        let harness = try Harness()
+        let manager = harness.makeManager()
+        try await manager.start()
+        _ = try await suspendFinalisation(harness, manager: manager, gate: .beforeRename)
+
+        try await manager.remove(itemID("a"))
+        let removing = await manager.state(for: itemID("a"))
+        let stored = await harness.store.contents?.records.first
+        XCTAssertEqual(removing, .removing, "removal waits while the worker can still create a file")
+        XCTAssertTrue(stored?.ownedPaths.contains(.media(generation: 1)) == true, "the planned destination is persisted with the tombstone")
+
+        await harness.finalizer.release()
+        await eventually("removal finished") { await manager.state(for: itemID("a")) == .notDownloaded }
+
+        let finalExists = await harness.fileSystem.hasFile(harness.url(.media(generation: 1)))
+        let stagingExists = await harness.fileSystem.hasFile(harness.url(path("staging/a")))
+        XCTAssertFalse(finalExists)
+        XCTAssertFalse(stagingExists)
+    }
+
+    func testRemovalAfterRenameDeletesTheRenamedFile() async throws {
+        let harness = try Harness()
+        let manager = harness.makeManager()
+        try await manager.start()
+        _ = try await suspendFinalisation(harness, manager: manager, gate: .afterRename)
+        let renamed = await harness.fileSystem.hasFile(harness.url(.media(generation: 1)))
+        XCTAssertTrue(renamed)
+
+        try await manager.remove(itemID("a"))
+        await harness.finalizer.release()
+        await eventually("removal finished") { await manager.state(for: itemID("a")) == .notDownloaded }
+
+        let finalExists = await harness.fileSystem.hasFile(harness.url(.media(generation: 1)))
+        XCTAssertFalse(finalExists, "no media file survives the removal of its item")
+    }
+
+    func testDetachWaitsForTheFinaliserBeforeANewOwnerStarts() async throws {
+        let first = try Harness()
+        let owner = first.makeManager()
+        try await owner.start()
+        _ = try await suspendFinalisation(first, manager: owner, gate: .beforeRename)
+
+        let detaching = Task { await owner.detach() }
+        await eventually("detach step ran") { await owner.engine.isDetached }
+        let next = try restart(first, session: FakeTransferSession(identifier: first.sessionIdentifier)).makeManager()
+        await assertThrows(.ownerAlreadyActive) { try await next.start() }
+
+        await first.finalizer.release()
+        await detaching.value
+        try await next.start()
+        await settle(next)
+
+        let state = await next.state(for: itemID("a"))
+        let finalExists = await first.fileSystem.hasFile(first.url(.media(generation: 1)))
+        XCTAssertEqual(state, .completed(at: referenceDate), "the new owner recovers the worker's rename")
+        XCTAssertTrue(finalExists)
+    }
+
+    // MARK: leases across owners
+
+    func testLeaseOfAReleasedManagerEndsThroughItsSuccessor() async throws {
+        let first = try Harness()
+        var owner: DownloadManager? = first.makeManager()
+        try await owner?.start()
+        try await completeItem("a", manager: try XCTUnwrap(owner), harness: first)
+        let lookup = try await owner?.localFile(for: itemID("a"))
+        guard case .available(let lease) = lookup else { return XCTFail("expected an available file") }
+        owner = nil
+
+        let next = try restart(first, session: FakeTransferSession(identifier: first.sessionIdentifier)).makeManager()
+        await assertThrows(.ownerAlreadyActive) { try await next.start() }
+
+        await next.endAccess(lease)
+        await next.endAccess(lease)
+        try await next.start()
+
+        let state = await next.state(for: itemID("a"))
+        XCTAssertEqual(state, .completed(at: referenceDate))
+        withExtendedLifetime(lease) {}
+    }
+
+    // MARK: replay before recovered finalisation
+
+    func testReplayedCaptureThenSuccessfulRecoveredValidation() async throws {
+        let sessionIdentifier = Harness.uniqueName("session")
+        let (store, finished, generation) = try capturedIndex(session: sessionIdentifier)
+        let session = FakeTransferSession(identifier: sessionIdentifier, backlog: [finished])
+        let harness = try Harness(sessionIdentifier: sessionIdentifier, store: store, session: session)
+        await harness.fileSystem.putFile(harness.url(path("staging/x")), size: 10)
+        let manager = harness.makeManager()
+
+        try await manager.start()
+        await settle(manager)
+
+        let state = await manager.state(for: itemID("a"))
+        let acknowledged = await session.acknowledged
+        let requests = await harness.finalizer.requests.count
+        let submissions = await session.submissions
+        let finalExists = await harness.fileSystem.hasFile(harness.url(.media(generation: generation)))
+        XCTAssertEqual(state, .completed(at: referenceDate))
+        XCTAssertEqual(acknowledged, 2)
+        XCTAssertEqual(requests, 1)
+        XCTAssertTrue(submissions.isEmpty)
+        XCTAssertTrue(finalExists)
+    }
+
+    func testReplayedCaptureThenFailedRecoveredValidation() async throws {
+        let sessionIdentifier = Harness.uniqueName("session")
+        let (store, finished, generation) = try capturedIndex(session: sessionIdentifier)
+        let session = FakeTransferSession(identifier: sessionIdentifier, backlog: [finished])
+        let harness = try Harness(sessionIdentifier: sessionIdentifier, store: store, session: session)
+        await harness.fileSystem.putFile(harness.url(path("staging/x")), size: 10)
+        await harness.finalizer.setMode(.fail(.integrity))
+        let manager = harness.makeManager()
+
+        try await manager.start()
+        await settle(manager)
+
+        let stored = await store.contents?.records.first
+        let stagingExists = await harness.fileSystem.hasFile(harness.url(path("staging/x")))
+        XCTAssertEqual(stored?.phase, .failed(DownloadFailure(kind: .integrity)))
+        XCTAssertEqual(stored?.journal, .rejected)
+        XCTAssertNil(stored?.stagingPath)
+        XCTAssertFalse(stagingExists)
+
+        try await manager.retry(itemID("a"))
+        let submissions = await session.submissions
+        let requests = await harness.finalizer.requests.count
+        XCTAssertEqual(submissions.count, 1, "retry starts a fresh transfer")
+        XCTAssertGreaterThan(submissions.first?.generation ?? 0, generation)
+        XCTAssertEqual(requests, 1)
+    }
+
+    func testRecoveredFailureWinningTheRaceNeverRevivesTheCapture() async throws {
+        let sessionIdentifier = Harness.uniqueName("session")
+        let (store, finished, generation) = try capturedIndex(session: sessionIdentifier)
+        let session = FakeTransferSession(identifier: sessionIdentifier, deliversBacklogMarker: false)
+        let harness = try Harness(sessionIdentifier: sessionIdentifier, store: store, session: session, reconciliationTimeout: 5)
+        await harness.fileSystem.putFile(harness.url(path("staging/x")), size: 10)
+        await harness.finalizer.setMode(.fail(.integrity))
+        let manager = harness.makeManager()
+
+        try await manager.start()
+        let early = await harness.finalizer.requests.count
+        XCTAssertEqual(early, 0, "recovered finalisation waits for the startup replay")
+
+        await harness.clock.advance(by: 5)
+        await settle(manager)
+        let failed = await manager.state(for: itemID("a"))
+        XCTAssertEqual(failed, .failed(DownloadFailure(kind: .integrity)))
+
+        let sequence = await session.emit(finished)
+        await eventually("late replay applied") { await session.acknowledged == sequence }
+
+        let stored = await store.contents?.records.first
+        XCTAssertEqual(stored?.journal, .rejected, "the replay does not capture deleted bytes again")
+        XCTAssertNil(stored?.stagingPath)
+        XCTAssertEqual(stored?.phase, .failed(DownloadFailure(kind: .integrity)))
+
+        try await manager.retry(itemID("a"))
+        let submissions = await session.submissions
+        let requests = await harness.finalizer.requests.count
+        XCTAssertEqual(submissions.map(\.generation).count, 1)
+        XCTAssertGreaterThan(submissions.first?.generation ?? 0, generation)
+        XCTAssertEqual(requests, 1)
+    }
+
+    // MARK: exact stop identity
+
+    func testPendingStopLeavesAnUnmappedTaskWithTheSameNumberAlone() async throws {
+        let sessionIdentifier = Harness.uniqueName("session")
+        var machine = DownloadStateMachine.fresh(session: sessionIdentifier)
+        try machine.enqueueAndBind("a", task: 101)
+        _ = try machine.handle(.cancel(itemID("a")), now: referenceDate)
+        let store = InMemoryIndexStore(contents: contents(of: machine))
+        let foreign = SystemTransferTask(taskIdentifier: 101, taskDescription: "host-owned task")
+        let session = FakeTransferSession(identifier: sessionIdentifier, unmappedTasks: [foreign])
+
+        let manager = try Harness(sessionIdentifier: sessionIdentifier, store: store, session: session).makeManager()
+        try await manager.start()
+
+        let cancellations = await session.cancellations
+        let stored = await store.contents?.records.first
+        XCTAssertTrue(cancellations.isEmpty, "a foreign task is never cancelled")
+        XCTAssertNil(stored?.stoppingBinding, "the old stop is acknowledged")
+    }
+
+    func testPendingStopLeavesAnotherItemsTaskWithTheSameNumberAlone() async throws {
+        let sessionIdentifier = Harness.uniqueName("session")
+        var machine = DownloadStateMachine.fresh(session: sessionIdentifier)
+        try machine.enqueueAndBind("a", task: 101)
+        _ = try machine.handle(.cancel(itemID("a")), now: referenceDate)
+        _ = try machine.handle(.enqueue(makeRequest("b")), now: referenceDate)
+        let generationB = machine.generation("b")
+        let store = InMemoryIndexStore(contents: contents(of: machine))
+        let session = FakeTransferSession(identifier: sessionIdentifier, liveTasks: [reference("b", generation: generationB, task: 101)])
+
+        let manager = try Harness(sessionIdentifier: sessionIdentifier, store: store, session: session).makeManager()
+        try await manager.start()
+        await eventually("backlog applied") { await session.acknowledged == 1 }
+        withExtendedLifetime(manager) {}
+
+        let cancellations = await session.cancellations
+        let records = await store.contents?.records ?? []
+        let a = records.first { $0.id == itemID("a") }
+        let b = records.first { $0.id == itemID("b") }
+        XCTAssertTrue(cancellations.isEmpty, "the reused number names another attempt")
+        XCTAssertNil(a?.stoppingBinding)
+        XCTAssertEqual(b?.binding?.taskIdentifier, 101)
+        XCTAssertEqual(b?.generation, generationB)
+    }
+
+    // MARK: reconciliation fence and wake budget
+
+    func testWithheldBacklogMarkerLeavesIntentUnresolvedAtTheDeadline() async throws {
+        let sessionIdentifier = Harness.uniqueName("session")
+        var machine = DownloadStateMachine.fresh(session: sessionIdentifier)
+        _ = try machine.handle(.enqueue(makeRequest("a")), now: referenceDate)
+        let generation = machine.generation("a")
+        let store = InMemoryIndexStore(contents: contents(of: machine))
+        let session = FakeTransferSession(identifier: sessionIdentifier, deliversBacklogMarker: false)
+        let harness = try Harness(sessionIdentifier: sessionIdentifier, store: store, session: session, reconciliationTimeout: 5)
+        let manager = harness.makeManager()
+
+        try await manager.start()
+        let open = await manager.reconciliationStatus()
+        XCTAssertEqual(open, .awaitingBacklog(deadline: referenceDate.addingTimeInterval(5)))
+
+        await harness.clock.advance(by: 5)
+        await eventually("deadline handled") { await manager.reconciliationStatus() != open }
+
+        let status = await manager.reconciliationStatus()
+        let submissions = await session.submissions
+        let stored = await store.contents?.records.first
+        XCTAssertEqual(status, .unresolved(items: [itemID("a")], reason: .deadlineExceeded))
+        XCTAssertTrue(submissions.isEmpty, "a timeout is not proof of absence")
+        XCTAssertEqual(stored?.generation, generation)
+        XCTAssertEqual(stored?.phase, .queued)
+        await assertThrows(.reconciliationUnresolved) { try await manager.flushPendingWork() }
+
+        await session.emit(payload: .backlogDelivered)
+        await eventually("late marker resolves") { await manager.reconciliationStatus() == .resolved }
+        let replacements = await session.submissions
+        XCTAssertEqual(replacements.map(\.generation), [generation + 1], "only now is the gone attempt replaced")
+    }
+
+    func testUnresolvedAttemptIsAdoptedWhenItsTaskIsFoundLater() async throws {
+        let sessionIdentifier = Harness.uniqueName("session")
+        var machine = DownloadStateMachine.fresh(session: sessionIdentifier)
+        _ = try machine.handle(.enqueue(makeRequest("a")), now: referenceDate)
+        let generation = machine.generation("a")
+        let store = InMemoryIndexStore(contents: contents(of: machine))
+        let session = FakeTransferSession(identifier: sessionIdentifier, deliversBacklogMarker: false)
+        let harness = try Harness(sessionIdentifier: sessionIdentifier, store: store, session: session, reconciliationTimeout: 5)
+        let manager = harness.makeManager()
+        try await manager.start()
+        await harness.clock.advance(by: 5)
+        await eventually("unresolved") {
+            if case .unresolved = await manager.reconciliationStatus() { return true } else { return false }
+        }
+
+        await session.addSystemTask(reference("a", generation: generation, task: 77))
+        try await manager.flushPendingWork()
+
+        let status = await manager.reconciliationStatus()
+        let stored = await store.contents?.records.first
+        let submissions = await session.submissions
+        XCTAssertEqual(status, .resolved)
+        XCTAssertEqual(stored?.binding?.taskIdentifier, 77)
+        XCTAssertTrue(submissions.isEmpty)
+    }
+
+    func testWakeHandlerIsReleasedAtTheBudgetWhenWritesFail() async throws {
+        let harness = try Harness(backgroundWakeBudget: 10)
+        let manager = harness.makeManager()
+        let counter = CallCounter()
+        _ = await MainActor.run { manager.handleBackgroundEvents(forSession: harness.sessionIdentifier) { counter.count += 1 } }
+        try await manager.start()
+        try await manager.enqueue(makeRequest("a"))
+        let reference = try await XCTUnwrapAsync(await harness.session.latestReference(for: itemID("a")))
+        let captured = path("staging/a")
+        await harness.fileSystem.putFile(harness.url(captured), size: 10)
+
+        await harness.store.setFailWrites(true)
+        let finished = await harness.session.emit(.finished(reference, captured: captured, bytes: 10, validators: nil))
+        let marker = await harness.session.emit(payload: .backgroundEventsFinished)
+        await eventually("wake budget armed") { await harness.clock.sleeperCount == 1 }
+        let early = await MainActor.run { counter.count }
+        XCTAssertEqual(early, 0)
+
+        await harness.clock.advance(by: 10)
+        await eventually("handler released at the budget") { await MainActor.run { counter.count } == 1 }
+        let acknowledged = await harness.session.acknowledged ?? 0
+        XCTAssertLessThan(acknowledged, finished, "uncommitted events stay with the session")
+
+        await harness.store.setFailWrites(false)
+        try await manager.flushPendingWork()
+        await settle(manager)
+
+        let state = await manager.state(for: itemID("a"))
+        let acknowledgedAfter = await harness.session.acknowledged
+        let calls = await MainActor.run { counter.count }
+        XCTAssertEqual(state, .completed(at: referenceDate.addingTimeInterval(10)))
+        XCTAssertEqual(acknowledgedAfter, marker)
+        XCTAssertEqual(calls, 1, "the handler is not called a second time")
+    }
+
+    func testFinaliserIsGivenTheConfiguredBudget() async throws {
+        let harness = try Harness(finalizationBudget: 7)
+        let manager = harness.makeManager()
+        try await manager.start()
+        try await completeItem("a", manager: manager, harness: harness)
+
+        let deadline = await harness.finalizer.requests.first?.deadline
+        XCTAssertEqual(deadline, referenceDate.addingTimeInterval(7))
+    }
+
+    // MARK: cleanup intent
+
+    func testFailedDiscardIsKeptAndRetriedUntilVerified() async throws {
+        let harness = try Harness()
+        let manager = harness.makeManager()
+        try await manager.start()
+        let stale = path("staging/stale")
+        await harness.fileSystem.putFile(harness.url(stale), size: 4)
+        await harness.fileSystem.configure(failRemove: true)
+
+        let sequence = await harness.session.emit(.finished(reference("gone", generation: 99), captured: stale, bytes: 4, validators: nil))
+        await eventually("stale completion processed") { await harness.session.acknowledged == sequence }
+
+        let queued = await harness.store.contents?.cleanupPaths
+        let stillThere = await harness.fileSystem.hasFile(harness.url(stale))
+        XCTAssertEqual(queued, [stale], "the failed deletion is not forgotten")
+        XCTAssertTrue(stillThere)
+
+        await harness.fileSystem.configure()
+        try await manager.flushPendingWork()
+
+        let closed = await harness.store.contents?.cleanupPaths
+        let gone = await harness.fileSystem.hasFile(harness.url(stale))
+        XCTAssertEqual(closed, [])
+        XCTAssertFalse(gone)
+    }
+
+    func testCleanupCommittedBeforeAnInterruptionFinishesOnRestart() async throws {
+        var machine = DownloadStateMachine.fresh()
+        let generation = try machine.enqueueAndBind("a")
+        _ = machine.send(.finished(reference("a", generation: generation), captured: path("staging/x"), bytes: 10, validators: nil))
+        _ = machine.handle(.finalizationFailed(itemID("a"), generation: generation, .integrity), now: referenceDate, jitter: 0)
+        XCTAssertTrue(machine.cleanup.contains(path("staging/x")), "committed together with the rejection")
+        let store = InMemoryIndexStore(contents: contents(of: machine))
+        let harness = try Harness(store: store)
+        await harness.fileSystem.putFile(harness.url(path("staging/x")), size: 10)
+
+        try await harness.makeManager().start()
+
+        let exists = await harness.fileSystem.hasFile(harness.url(path("staging/x")))
+        let cleanup = await store.contents?.cleanupPaths
+        XCTAssertFalse(exists)
+        XCTAssertEqual(cleanup, [])
+    }
+
+    func testUnknownFilesAreReportedAndNeverDeleted() async throws {
+        let first = try Harness()
+        let manager = first.makeManager()
+        try await manager.start()
+        try await completeItem("a", manager: manager, harness: first)
+        let mystery = path("staging/mystery")
+        let orphan = path("media/item-77")
+        await first.fileSystem.putFile(first.url(mystery), size: 3)
+        await first.fileSystem.putFile(first.url(orphan), size: 3)
+
+        let unknown = try await manager.unreferencedFiles()
+        XCTAssertEqual(unknown, [orphan, mystery])
+
+        await manager.detach()
+        let restarted = try restart(first, session: FakeTransferSession(identifier: first.sessionIdentifier)).makeManager()
+        try await restarted.start()
+        let mysteryKept = await first.fileSystem.hasFile(first.url(mystery))
+        let orphanKept = await first.fileSystem.hasFile(first.url(orphan))
+        XCTAssertTrue(mysteryKept)
+        XCTAssertTrue(orphanKept)
+    }
+
+    // MARK: completion and cancel
+
+    func testCancelBeforeValidationKeepsTheItemCancelledUntilRetry() async throws {
+        try await assertCancelDuringFinalisation(gate: .beforeRename)
+    }
+
+    func testCancelAfterRenameKeepsTheItemCancelledUntilRetry() async throws {
+        try await assertCancelDuringFinalisation(gate: .afterRename)
+    }
+
+    private func assertCancelDuringFinalisation(gate: FakeFinalizer.Gate, file: StaticString = #filePath, line: UInt = #line) async throws {
+        let harness = try Harness()
+        let manager = harness.makeManager()
+        try await manager.start()
+        _ = try await suspendFinalisation(harness, manager: manager, gate: gate)
+
+        try await manager.cancel(itemID("a"))
+        await harness.finalizer.release()
+        await settle(manager)
+
+        let cancelled = await manager.state(for: itemID("a"))
+        let lookup = try await manager.localFile(for: itemID("a"))
+        let kept = await harness.fileSystem.hasFile(harness.url(.media(generation: 1)))
+        XCTAssertEqual(cancelled, .failed(DownloadFailure(kind: .cancelled)), file: file, line: line)
+        XCTAssertEqual(lookup, .unavailable(.failed(DownloadFailure(kind: .cancelled))), file: file, line: line)
+        XCTAssertTrue(kept, "the validated file stays with the cancelled record", file: file, line: line)
+
+        try await manager.retry(itemID("a"))
+        await settle(manager)
+
+        let state = await manager.state(for: itemID("a"))
+        let submissions = await harness.session.submissions
+        let generations = await harness.finalizer.requests.map(\.generation)
+        XCTAssertEqual(state, .completed(at: referenceDate), file: file, line: line)
+        XCTAssertEqual(submissions.count, 1, "no new transfer", file: file, line: line)
+        XCTAssertEqual(generations, [1, 1], file: file, line: line)
+    }
+}

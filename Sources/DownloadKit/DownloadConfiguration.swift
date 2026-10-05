@@ -21,6 +21,18 @@ public struct DownloadConfiguration: Sendable {
     public var retryPolicy: RetryPolicy
     /// The minimum interval between two snapshot deliveries. Zero delivers every change.
     public var snapshotInterval: TimeInterval
+    /// How long start-up reconciliation waits for the session to report its backlog
+    /// delivered. When it passes, nothing is concluded about attempts whose task could not be
+    /// found: they keep their intent and bytes, and ``DownloadManager/reconciliationStatus()``
+    /// reports them as ``ReconciliationStatus/unresolved(items:reason:)``.
+    public var reconciliationTimeout: TimeInterval
+    /// The longest a background-wake completion handler waits for the wake's events to be
+    /// committed. When the index cannot be updated in time, the handler is called anyway and
+    /// the uncommitted events stay unacknowledged with the session, which delivers them again.
+    public var backgroundWakeBudget: TimeInterval
+    /// The time a finaliser is given to validate and rename one file. A finaliser that cannot
+    /// finish by then defers; the capture stays and is finalised again later.
+    public var finalizationBudget: TimeInterval
     public var dependencies: DownloadDependencies
 
     public init(
@@ -29,6 +41,9 @@ public struct DownloadConfiguration: Sendable {
         defaultPolicy: NetworkPolicy = .default,
         retryPolicy: RetryPolicy = .default,
         snapshotInterval: TimeInterval = 0.25,
+        reconciliationTimeout: TimeInterval = 20,
+        backgroundWakeBudget: TimeInterval = 20,
+        finalizationBudget: TimeInterval = 15,
         dependencies: DownloadDependencies
     ) throws {
         guard !sessionIdentifier.isEmpty, sessionIdentifier.count <= Self.maximumSessionIdentifierLength else {
@@ -39,6 +54,9 @@ public struct DownloadConfiguration: Sendable {
         self.defaultPolicy = defaultPolicy
         self.retryPolicy = retryPolicy
         self.snapshotInterval = max(0, snapshotInterval)
+        self.reconciliationTimeout = max(0, reconciliationTimeout)
+        self.backgroundWakeBudget = max(0, backgroundWakeBudget)
+        self.finalizationBudget = max(0, finalizationBudget)
         self.dependencies = dependencies
     }
 }

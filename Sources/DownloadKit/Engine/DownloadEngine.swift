@@ -12,8 +12,20 @@
 //  rejected is kept and retried at the start of every later step (and by flushPendingWork);
 //  only advisory progress and waiting events may be dropped.
 //
+//  File workers: a finaliser runs outside the chain and is an ownership claim on its item's
+//  files and on the storage root. Its destination is persisted with the capture before it
+//  starts. Removal deletes the item's files, and detach releases the root, only after the
+//  worker returned. Neither waits for the worker inside a step (the worker's result is itself
+//  applied as a step): the worker releases its claim first, outside the chain, and the waiting
+//  work resumes at the next step or, for detach, after the detach step returned.
+//
 
 import Foundation
+
+/// Identifies the facade that owns an engine; the engine holds it weakly.
+final class EngineHost: Sendable {
+    init() {}
+}
 
 actor DownloadEngine {
     typealias Command = DownloadStateMachine.Command
@@ -25,6 +37,14 @@ actor DownloadEngine {
         case starting
         case running
         case detached
+    }
+
+    /// The start-up reconciliation fence.
+    private enum Fence: Equatable {
+        case notStarted
+        case open(deadline: Date)
+        case resolved
+        case unresolved(ReconciliationUnresolvedReason)
     }
 
     private struct PendingRemoval {
@@ -45,6 +65,9 @@ actor DownloadEngine {
     private let urlRefresher: (any URLRefreshing)?
     private let finalizer: any DownloadFinalizing
     private let backgroundEvents: BackgroundEventsCoordinator?
+    /// The facade that created this engine. When it is gone while a lease keeps the engine
+    /// alive, ending the last lease detaches the engine and frees the storage root.
+    private weak var host: EngineHost?
 
     private var lifecycle: Lifecycle = .idle
     private var machine: DownloadStateMachine?
@@ -57,9 +80,25 @@ actor DownloadEngine {
     private var subscribers: [UUID: AsyncStream<[DownloadSnapshot]>.Continuation] = [:]
     private var leases: [DownloadID: Set<UUID>] = [:]
     private var pendingRemovals: [DownloadID: PendingRemoval] = [:]
-    private var failedRemovals: Set<DownloadID> = []
+    /// Removals that could not finish yet (a failed deletion or write, or a running finaliser).
+    private var unfinishedRemovals: Set<DownloadID> = []
+    /// Queued deletions that failed; their persisted intent is retried.
+    private var failedCleanup: Set<RelativePath> = []
     private var retryTimers: [DownloadID: Task<Void, Never>] = [:]
+    /// Running finalisers. An entry is removed as soon as the finaliser returned, before its
+    /// result is applied: from then on it can no longer create files.
     private var finalizations: [AttemptKey: Task<Void, Never>] = [:]
+    /// Finaliser results not yet applied.
+    private var finalizationResultsPending = 0
+    /// Captured records found at start, finalised once the startup replay was drained.
+    private var recoveredFinalizations: [AttemptKey: RelativePath] = [:]
+    /// Callers of ``detach()`` waiting for running finalisers to return.
+    private var drainWaiters: [CheckedContinuation<Void, Never>] = []
+    private var fence: Fence = .notStarted
+    private var fenceTimer: Task<Void, Never>?
+    /// Wake markers whose host handlers were already released by the wake budget.
+    private var servicedWakeMarkers: Set<UInt64> = []
+    private var wakeTimer: Task<Void, Never>?
     private var consumers: [Task<Void, Never>] = []
     private var flushTask: Task<Void, Never>?
     private var lastEmission: Date?
@@ -80,12 +119,14 @@ actor DownloadEngine {
         configuration: DownloadConfiguration,
         urlRefresher: (any URLRefreshing)?,
         finalizer: any DownloadFinalizing,
-        backgroundEvents: BackgroundEventsCoordinator? = nil
+        backgroundEvents: BackgroundEventsCoordinator? = nil,
+        host: EngineHost? = nil
     ) {
         self.configuration = configuration
         self.urlRefresher = urlRefresher
         self.finalizer = finalizer
         self.backgroundEvents = backgroundEvents
+        self.host = host
     }
 
     // MARK: Serialisation
@@ -129,7 +170,8 @@ actor DownloadEngine {
             await reconcile()
             startConsumers()
         } catch {
-            await teardown(releaseClaim: true)
+            teardown()
+            await releaseClaimIfHeld()
             machine = nil
             store = nil
             session = nil
@@ -203,19 +245,28 @@ actor DownloadEngine {
     ///    task matching an awaiting record's generation is adopted (its binding is written if
     ///    it was lost) instead of being replaced. Any other package task, including one a
     ///    paused, cancelled or removed record asked to stop, is cancelled again.
-    /// 2. Stopping bindings whose task is gone are acknowledged.
-    /// 3. Retry timers are re-armed, removals resume, captured records are finalised again
-    ///    and completed files are inspected (only a verified absence makes an item missing).
-    /// 4. Awaiting records with no live task become orphan candidates. They are resubmitted
-    ///    only when the session reports that its backlog was delivered, so a completion that
-    ///    was buffered before start is applied first.
+    /// 2. A stopping binding is enforced only against the exact task it names: same session,
+    ///    and a live task whose description maps to the same item and stopping generation.
+    ///    When that task is absent (its number is free, unmapped or names another attempt)
+    ///    the stop is acknowledged and the other task is left alone.
+    /// 3. The current path is applied. For attempts not yet confirmed it only changes the
+    ///    explanation; it never creates a replacement attempt.
+    /// 4. Queued deletions are retried, retry timers re-armed, removals resumed and completed
+    ///    files inspected (only a verified absence makes an item missing). Captured records
+    ///    are finalised again only after the startup replay was drained (step 5), so a replayed
+    ///    completion is applied before a recovered result can change the capture.
+    /// 5. Awaiting records with no live task become orphan candidates. The fence stays open
+    ///    until the session reports its backlog delivered (or a wake's events finished), so a
+    ///    completion buffered before start is applied first; only then are candidates
+    ///    resubmitted. At ``DownloadConfiguration/reconciliationTimeout`` the fence becomes
+    ///    unresolved: nothing is concluded and no replacement is created.
     private func reconcile() async {
         guard let session else { return }
-        if let pathSource = dependencies.pathSource, let status = await pathSource.currentStatus() {
-            await applyRetaining(.pathChanged(status))
-        }
-
         let tasks = await session.systemTasks().sorted { $0.taskIdentifier < $1.taskIdentifier }
+        var live: [Int: TransferTaskReference] = [:]
+        for task in tasks {
+            if let reference = task.reference { live[task.taskIdentifier] = reference }
+        }
         var adopted: Set<AttemptKey> = []
         var stopped: Set<Int> = []
         for task in tasks {
@@ -232,9 +283,8 @@ actor DownloadEngine {
                 && !adopted.contains(key)
             if wanted {
                 adopted.insert(key)
-                if record.binding?.taskIdentifier != reference.taskIdentifier || record.binding?.generation != reference.generation {
-                    await applyRetaining(.taskBound(reference.itemID, generation: reference.generation, taskIdentifier: reference.taskIdentifier))
-                }
+                // Confirms the attempt; writes only when the binding was lost or differs.
+                await applyRetaining(.taskBound(reference.itemID, generation: reference.generation, taskIdentifier: reference.taskIdentifier))
             } else {
                 let keepsResumeData = record.generation == reference.generation && Self.isStopped(record.phase)
                 await stopTask(reference.taskIdentifier, of: reference.itemID, producingResumeData: keepsResumeData)
@@ -242,14 +292,27 @@ actor DownloadEngine {
             }
         }
 
-        let liveIdentifiers = Set(tasks.map(\.taskIdentifier))
         for record in sortedRecords() {
-            guard let stopping = record.stoppingBinding, !stopped.contains(stopping.taskIdentifier) else { continue }
-            if liveIdentifiers.contains(stopping.taskIdentifier) {
-                await stopTask(stopping.taskIdentifier, of: record.id, producingResumeData: record.phase != .removing)
+            guard let stopping = record.stoppingBinding else { continue }
+            let task = live[stopping.taskIdentifier]
+            let sameTask = stopping.sessionIdentifier == session.identifier
+                && task?.itemID == record.id
+                && task?.generation == stopping.generation
+            if sameTask {
+                if !stopped.contains(stopping.taskIdentifier) {
+                    await stopTask(stopping.taskIdentifier, of: record.id, producingResumeData: record.phase != .removing)
+                }
             } else {
                 await applyRetaining(.stopAcknowledged(record.id, taskIdentifier: stopping.taskIdentifier))
             }
+        }
+
+        if let pathSource = dependencies.pathSource, let status = await pathSource.currentStatus() {
+            await applyRetaining(.pathChanged(status))
+        }
+
+        for path in (machine?.cleanup ?? []).sorted(by: { $0.rawValue < $1.rawValue }) {
+            await discard(path)
         }
 
         for record in sortedRecords() {
@@ -263,7 +326,7 @@ actor DownloadEngine {
                 await inspectCompletedAtStart(record)
             case .active where record.journal == .captured:
                 if let captured = record.stagingPath {
-                    startFinalization(record.id, generation: record.generation, captured: captured)
+                    recoveredFinalizations[AttemptKey(id: record.id, generation: record.generation)] = captured
                 }
             default:
                 guard record.phase.isAwaitingTransfer, record.journal != .captured else { continue }
@@ -271,6 +334,114 @@ actor DownloadEngine {
                     orphanCandidates[record.id] = record.generation
                 }
             }
+        }
+
+        if orphanCandidates.isEmpty && recoveredFinalizations.isEmpty {
+            fence = .resolved
+        } else {
+            await openFence()
+        }
+    }
+
+    private func openFence() async {
+        let clock = dependencies.clock
+        let deadline = await clock.now().addingTimeInterval(configuration.reconciliationTimeout)
+        fence = .open(deadline: deadline)
+        fenceTimer = Task { [weak self] in
+            do {
+                try await clock.sleep(until: deadline)
+            } catch {
+                return
+            }
+            await self?.fenceDeadlinePassed()
+        }
+    }
+
+    private func fenceDeadlinePassed() async {
+        _ = try? await serialized { [self] in await self.runFenceDeadline() }
+    }
+
+    /// The backlog marker did not come in time. Tasks that can be found now are adopted; for
+    /// the rest nothing is concluded. Recovered finalisations start: a late replay of their
+    /// completion can no longer capture again (one capture per attempt).
+    private func runFenceDeadline() async {
+        fenceTimer = nil
+        guard case .open = fence, lifecycle == .running else { return }
+        await adoptLiveCandidates()
+        fence = orphanCandidates.isEmpty ? .resolved : .unresolved(.deadlineExceeded)
+        await startRecoveredFinalizations()
+    }
+
+    /// The session's stream finished. An open fence cannot be closed by a marker any more.
+    private func sessionEventsEnded() async {
+        _ = try? await serialized { [self] in
+            guard await self.isFenceOpen() else { return }
+            await self.markFence(.unresolved(.sessionEnded))
+            await self.startRecoveredFinalizations()
+        }
+    }
+
+    private func isFenceOpen() -> Bool {
+        guard lifecycle == .running, case .open = fence else { return false }
+        return true
+    }
+
+    private func markFence(_ state: Fence) {
+        fence = state
+        if case .open = state { return }
+        fenceTimer?.cancel()
+        fenceTimer = nil
+    }
+
+    /// Closes the fence after the session proved its backlog drained: resolves the orphan
+    /// candidates, then starts recovered finalisations. Returns false when a write was
+    /// rejected; the marker is then retried.
+    private func resolveFence() async -> Bool {
+        guard await resolveOrphanCandidates() else { return false }
+        if fence != .resolved { markFence(.resolved) }
+        await startRecoveredFinalizations()
+        return true
+    }
+
+    /// Adopts orphan candidates whose task the session reports now. Presence is proof;
+    /// absence is not, so nothing else changes.
+    private func adoptLiveCandidates() async {
+        guard !orphanCandidates.isEmpty, let session else { return }
+        var live: [AttemptKey: Int] = [:]
+        for task in await session.systemTasks() {
+            guard let reference = task.reference else { continue }
+            live[AttemptKey(id: reference.itemID, generation: reference.generation)] = reference.taskIdentifier
+        }
+        for key in orphanCandidates.map({ AttemptKey(id: $0.key, generation: $0.value) }).sorted() {
+            guard let record = machine?.records[key.id], record.generation == key.generation,
+                  record.phase.isAwaitingTransfer, record.journal != .captured else {
+                orphanCandidates[key.id] = nil
+                continue
+            }
+            if let taskIdentifier = live[key] {
+                orphanCandidates[key.id] = nil
+                await applyRetaining(.taskBound(key.id, generation: key.generation, taskIdentifier: taskIdentifier))
+            }
+        }
+    }
+
+    private func startRecoveredFinalizations() async {
+        for key in recoveredFinalizations.keys.sorted() {
+            // Each entry is dropped only once its finaliser is registered, so the work is never
+            // invisible in between.
+            defer { recoveredFinalizations[key] = nil }
+            guard let captured = recoveredFinalizations[key], let record = machine?.records[key.id], record.generation == key.generation,
+                  record.journal == .captured, record.phase == .active, record.stagingPath == captured else { continue }
+            await startFinalization(key.id, generation: key.generation, captured: captured)
+        }
+    }
+
+    func reconciliationStatus() -> ReconciliationStatus {
+        switch fence {
+        case .notStarted: return .notStarted
+        case .open(let deadline): return .awaitingBacklog(deadline: deadline)
+        case .resolved: return .resolved
+        case .unresolved(let reason): return .unresolved(items: orphanCandidates.keys.sorted(), reason: reason)
         }
     }
 
@@ -334,6 +505,7 @@ actor DownloadEngine {
                 guard let self else { return }
                 await self.receive(event)
             }
+            await self?.sessionEventsEnded()
         })
         if let pathSource = dependencies.pathSource {
             let updates = pathSource.updates
@@ -348,29 +520,49 @@ actor DownloadEngine {
 
     func detach() async {
         _ = try? await serialized { [self] in await self.runDetach() }
+        // Second phase, outside the chain: a running finaliser applies its result as a step,
+        // so waiting for it inside the detach step would never end.
+        await waitForFinalizers()
     }
 
-    /// Stops observing and ends snapshot streams. The storage claim is released now, or, while
-    /// leases are outstanding, when the last one ends: no other manager can own the root while
-    /// a leased file must stay on disk. Unapplied session events stay unacknowledged.
+    /// Stops observing and ends snapshot streams. The storage claim is released once no
+    /// finaliser runs and no lease is outstanding: no other manager can own the root while a
+    /// worker can still write to it or a leased file must stay on disk. Unapplied session
+    /// events stay unacknowledged.
     private func runDetach() async {
         guard lifecycle == .running else { return }
         lifecycle = .detached
-        await teardown(releaseClaim: leases.isEmpty)
+        teardown()
+        await releaseClaimIfQuiet()
     }
 
-    private func teardown(releaseClaim: Bool) async {
+    private func teardown() {
         for consumer in consumers { consumer.cancel() }
         consumers = []
         for timer in retryTimers.values { timer.cancel() }
         retryTimers = [:]
+        // Cancellation is cooperative: the entries stay until each finaliser returned.
         for finalization in finalizations.values { finalization.cancel() }
-        finalizations = [:]
+        fenceTimer?.cancel()
+        fenceTimer = nil
+        wakeTimer?.cancel()
+        wakeTimer = nil
         flushTask?.cancel()
         flushTask = nil
         for continuation in subscribers.values { continuation.finish() }
         subscribers = [:]
-        if releaseClaim { await releaseClaimIfHeld() }
+    }
+
+    private func waitForFinalizers() async {
+        guard !finalizations.isEmpty else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            drainWaiters.append(continuation)
+        }
+    }
+
+    private func releaseClaimIfQuiet() async {
+        guard leases.isEmpty, finalizations.isEmpty else { return }
+        await releaseClaimIfHeld()
     }
 
     private func releaseClaimIfHeld() async {
@@ -400,8 +592,10 @@ actor DownloadEngine {
         }
     }
 
-    /// Retries retained events and failed removals, throwing ``DownloadError/persistenceFailed``
-    /// when events are still waiting for an index write.
+    /// Retries retained events, failed removals and queued deletions, throwing
+    /// ``DownloadError/persistenceFailed`` when events are still waiting for an index write,
+    /// and ``DownloadError/reconciliationUnresolved`` when start-up reconciliation timed out and
+    /// some attempts still cannot be found.
     func flushPendingWork() async throws {
         try await serialized { [self] in try await self.runFlush() }
     }
@@ -409,6 +603,11 @@ actor DownloadEngine {
     private func runFlush() async throws {
         try requireRunning()
         if !retained.isEmpty || !inbox.isEmpty { throw DownloadError.persistenceFailed }
+        if case .unresolved = fence {
+            await adoptLiveCandidates()
+            guard orphanCandidates.isEmpty else { throw DownloadError.reconciliationUnresolved }
+            markFence(.resolved)
+        }
     }
 
     private func runCommand(_ command: Command) async throws {
@@ -442,7 +641,8 @@ actor DownloadEngine {
     }
 
     /// Applies inbox entries in order until one cannot be committed, then acknowledges the
-    /// applied prefix to the session.
+    /// applied prefix to the session. A wake marker stuck behind an uncommitted entry arms the
+    /// wake budget.
     private func drainInbox() async {
         guard lifecycle == .running else { return }
         var applied: UInt64?
@@ -452,6 +652,12 @@ actor DownloadEngine {
             applied = head.sequence
         }
         if let applied, let session { await session.acknowledge(through: applied) }
+        if hasUnservicedWakeMarker {
+            await armWakeBudget()
+        } else {
+            wakeTimer?.cancel()
+            wakeTimer = nil
+        }
     }
 
     private func process(_ envelope: TransferSessionEvent) async -> Bool {
@@ -460,11 +666,53 @@ actor DownloadEngine {
             let committed = await apply(event: .transfer(event))
             return committed || (!event.isTerminal && lifecycle == .running)
         case .backlogDelivered:
-            return await resolveOrphanCandidates()
+            return await resolveFence()
         case .backgroundEventsFinished:
-            if let backgroundEvents { await backgroundEvents.eventsApplied() }
+            // The system delivered every event of the wake: also a drain boundary.
+            guard await resolveFence() else { return false }
+            if servicedWakeMarkers.remove(envelope.sequence) == nil, let backgroundEvents {
+                await backgroundEvents.eventsApplied()
+            }
             return true
         }
+    }
+
+    private var hasUnservicedWakeMarker: Bool {
+        inbox.contains { envelope in
+            guard case .backgroundEventsFinished = envelope.payload else { return false }
+            return !servicedWakeMarkers.contains(envelope.sequence)
+        }
+    }
+
+    private func armWakeBudget() async {
+        guard wakeTimer == nil, backgroundEvents != nil else { return }
+        let clock = dependencies.clock
+        let deadline = await clock.now().addingTimeInterval(configuration.backgroundWakeBudget)
+        guard wakeTimer == nil else { return }
+        wakeTimer = Task { [weak self] in
+            do {
+                try await clock.sleep(until: deadline)
+            } catch {
+                return
+            }
+            await self?.wakeBudgetExpired()
+        }
+    }
+
+    /// The wake budget passed while its events could not be committed. Runs outside the chain,
+    /// so a step stuck on the index cannot hold the host's handler: the handler is released
+    /// now, and the uncommitted events stay unacknowledged with the session, which keeps them
+    /// durably and delivers them again. When the marker is applied later it calls nothing.
+    private func wakeBudgetExpired() async {
+        wakeTimer = nil
+        guard lifecycle == .running else { return }
+        var released = false
+        for envelope in inbox {
+            guard case .backgroundEventsFinished = envelope.payload, !servicedWakeMarkers.contains(envelope.sequence) else { continue }
+            servicedWakeMarkers.insert(envelope.sequence)
+            released = true
+        }
+        if released, let backgroundEvents { await backgroundEvents.eventsApplied() }
     }
 
     /// Fires every scheduled retry whose time has come.
@@ -490,7 +738,7 @@ actor DownloadEngine {
     // MARK: Pending work
 
     private var hasPendingWork: Bool {
-        !retained.isEmpty || !inbox.isEmpty || !failedRemovals.isEmpty
+        !retained.isEmpty || !inbox.isEmpty || !unfinishedRemovals.isEmpty || !failedCleanup.isEmpty
     }
 
     /// Bounded in-process recovery: one attempt per step, never a loop.
@@ -501,13 +749,16 @@ actor DownloadEngine {
             retained = []
             for event in batch { await applyRetaining(event) }
         }
-        for id in failedRemovals.sorted() {
+        for id in unfinishedRemovals.sorted() {
             await completeRemovalIfUnleased(id)
+        }
+        for path in failedCleanup.sorted(by: { $0.rawValue < $1.rawValue }) {
+            await discard(path)
         }
         if !inbox.isEmpty { await drainInbox() }
     }
 
-    var pendingWorkCount: Int { retained.count + inbox.count + failedRemovals.count }
+    var pendingWorkCount: Int { retained.count + inbox.count + unfinishedRemovals.count + failedCleanup.count }
 
     // MARK: Applying
 
@@ -560,7 +811,9 @@ actor DownloadEngine {
                 upserts: outcome.changed.subtracting(outcome.deleted).sorted().compactMap { next.records[$0] },
                 deletions: outcome.deleted.sorted(),
                 nextGeneration: next.nextGeneration,
-                defaultPolicy: outcome.globalsChanged ? next.defaultPolicy : nil
+                defaultPolicy: outcome.globalsChanged ? next.defaultPolicy : nil,
+                cleanupQueued: outcome.cleanupQueued.sorted { $0.rawValue < $1.rawValue },
+                cleanupCompleted: outcome.cleanupCompleted.sorted { $0.rawValue < $1.rawValue }
             )
             guard let store else { throw DownloadError.notStarted }
             do {
@@ -581,7 +834,7 @@ actor DownloadEngine {
             case .cancelTask(let id, let taskIdentifier, let producingResumeData):
                 await stopTask(taskIdentifier, of: id, producingResumeData: producingResumeData)
             case .finalize(let id, let generation, let captured):
-                startFinalization(id, generation: generation, captured: captured)
+                await startFinalization(id, generation: generation, captured: captured)
             case .discardFile(let path):
                 await discard(path)
             case .deleteOwnedFiles(let id, let generation, let paths):
@@ -627,21 +880,25 @@ actor DownloadEngine {
     }
 
     /// Runs the finaliser outside the command chain. Its result is applied as an ordinary,
-    /// generation-checked event; one finalisation per attempt at a time.
-    private func startFinalization(_ id: DownloadID, generation: UInt64, captured: RelativePath) {
+    /// generation-checked event; one finalisation per attempt at a time. The destination was
+    /// persisted with the capture, so a file the finaliser creates is always owned.
+    private func startFinalization(_ id: DownloadID, generation: UInt64, captured: RelativePath) async {
+        let now = await dependencies.clock.now()
         let key = AttemptKey(id: id, generation: generation)
         guard finalizations[key] == nil, lifecycle == .running || lifecycle == .starting,
-              let layout, let record = machine?.records[id] else { return }
+              let layout, let record = machine?.records[id], record.generation == generation,
+              record.journal == .captured else { return }
         let request = FinalizationRequest(
             id: id,
             generation: generation,
             stagingPath: captured,
-            destination: .media(generation: generation),
+            destination: record.finalizationDestination ?? .media(generation: generation),
             storageRoot: layout.root,
             capturedBytes: record.bytesWritten,
             validators: record.validators,
             expectedLength: record.request.expectedLength,
-            checksum: record.request.checksum
+            checksum: record.request.checksum,
+            deadline: now.addingTimeInterval(configuration.finalizationBudget)
         )
         let finalizer = self.finalizer
         finalizations[key] = Task { [weak self] in
@@ -650,43 +907,85 @@ actor DownloadEngine {
         }
     }
 
+    /// The finaliser returned and can no longer create files. Its claim ends here, outside
+    /// the chain; its result is then applied as a step, which also lets a removal waiting for
+    /// it finish.
     private func finalizationEnded(_ id: DownloadID, generation: UInt64, result: FinalizationResult) async {
+        finalizations[AttemptKey(id: id, generation: generation)] = nil
+        finalizationResultsPending += 1
+        if finalizations.isEmpty {
+            let waiters = drainWaiters
+            drainWaiters = []
+            for waiter in waiters { waiter.resume() }
+        }
+        if lifecycle == .detached { await releaseClaimIfQuiet() }
+        _ = try? await serialized { [self] in await self.applyFinalizationResult(id, generation: generation, result: result) }
+        finalizationResultsPending -= 1
+    }
+
+    private func applyFinalizationResult(_ id: DownloadID, generation: UInt64, result: FinalizationResult) async {
         switch result {
         case .finalized(let finalPath, let integrity):
-            await ingest(.finalized(id, generation: generation, finalPath: finalPath, integrity: integrity))
+            await applyRetaining(.finalized(id, generation: generation, finalPath: finalPath, integrity: integrity))
         case .failed(let failure):
-            await ingest(.finalizationFailed(id, generation: generation, failure))
+            await applyRetaining(.finalizationFailed(id, generation: generation, failure))
         case .deferred:
             break
         }
-        finalizations[AttemptKey(id: id, generation: generation)] = nil
     }
 
-    var finalizationsInFlight: Int { finalizations.count }
+    /// Finalisers running, waiting to start after the startup replay, or whose result is not
+    /// applied yet.
+    var finalizationsInFlight: Int { finalizations.count + recoveredFinalizations.count + finalizationResultsPending }
 
+    /// Deletes a file whose deletion intent is persisted, and closes the intent only after the
+    /// deletion was verified. A file some record owns again is kept (ownership wins). A failed
+    /// deletion, inspection or write keeps the intent and is retried at the next step.
     private func discard(_ path: RelativePath) async {
-        guard let layout else { return }
-        try? await dependencies.fileSystem.removeItem(at: layout.url(for: path))
+        guard let layout, let machine, machine.cleanup.contains(path) else { return }
+        if !machine.isOwned(path) {
+            let url = layout.url(for: path)
+            do {
+                try await dependencies.fileSystem.removeItem(at: url)
+                guard try await dependencies.fileSystem.inspectItem(at: url) == .absent else {
+                    failedCleanup.insert(path)
+                    return
+                }
+            } catch {
+                failedCleanup.insert(path)
+                return
+            }
+        }
+        if await apply(event: .cleanupFinished(path)) {
+            failedCleanup.remove(path)
+        } else {
+            failedCleanup.insert(path)
+        }
     }
 
-    /// Deletes a tombstoned item's files once no lease protects them. The pending removal is
-    /// kept until the record's deletion is committed; a failed file deletion or index write is
-    /// retried at the next step.
+    /// Deletes a tombstoned item's files once no lease protects them and no finaliser of the
+    /// item can still create one. The pending removal is kept until the record's deletion is
+    /// committed; a failed file deletion or index write is retried at the next step.
     private func completeRemovalIfUnleased(_ id: DownloadID) async {
         guard lifecycle == .running, leases[id, default: []].isEmpty, let pending = pendingRemovals[id], let layout else { return }
+        guard !finalizations.keys.contains(where: { $0.id == id }) else {
+            // Retried at the step that applies the finaliser's result.
+            unfinishedRemovals.insert(id)
+            return
+        }
         for path in pending.paths {
             do {
                 try await dependencies.fileSystem.removeItem(at: layout.url(for: path))
             } catch {
-                failedRemovals.insert(id)
+                unfinishedRemovals.insert(id)
                 return
             }
         }
         if await apply(event: .removalFinished(id, generation: pending.generation)) {
             pendingRemovals[id] = nil
-            failedRemovals.remove(id)
+            unfinishedRemovals.remove(id)
         } else {
-            failedRemovals.insert(id)
+            unfinishedRemovals.insert(id)
         }
     }
 
@@ -748,22 +1047,58 @@ actor DownloadEngine {
         }
     }
 
+    /// Ends a lease this engine issued. Ending a lease twice does nothing.
     func endAccess(_ lease: LocalFileLease) async {
         _ = try? await serialized { [self] in await self.runEndAccess(lease) }
     }
 
     private func runEndAccess(_ lease: LocalFileLease) async {
-        leases[lease.id]?.remove(lease.token)
+        guard leases[lease.id]?.remove(lease.token) != nil else { return }
         if leases[lease.id]?.isEmpty == true { leases[lease.id] = nil }
+        if lifecycle == .running, host == nil {
+            // The manager was released while this lease kept its engine alive: stop owning
+            // the root now instead of waiting for the lease value to be released.
+            await runDetach()
+            return
+        }
         switch lifecycle {
         case .running:
             await completeRemovalIfUnleased(lease.id)
         case .detached:
             // A detached owner never deletes: the next owner finishes removals on its start.
-            if leases.isEmpty { await releaseClaimIfHeld() }
+            await releaseClaimIfQuiet()
         case .idle, .starting:
             break
         }
+    }
+
+    // MARK: Inventory
+
+    /// Files in `staging/` and `media/` that no record owns and no queued deletion names.
+    /// They are reported, never deleted: an unknown file is kept until the host decides.
+    func unreferencedFiles() async throws -> [RelativePath] {
+        try await serialized { [self] in try await self.runInventory() }
+    }
+
+    private func runInventory() async throws -> [RelativePath] {
+        try requireRunning()
+        guard let layout, let machine else { return [] }
+        var known = Set(machine.records.values.flatMap(\.ownedPaths))
+        known.formUnion(machine.cleanup)
+        var unknown: [RelativePath] = []
+        for (directory, name) in [(layout.staging, StorageLayout.stagingDirectory), (layout.media, StorageLayout.mediaDirectory)] {
+            let entries: [String]
+            do {
+                entries = try await dependencies.fileSystem.contentsOfDirectory(at: directory)
+            } catch {
+                throw DownloadError.storageUnavailable
+            }
+            for entry in entries {
+                guard let path = try? RelativePath("\(name)/\(entry)"), !known.contains(path) else { continue }
+                unknown.append(path)
+            }
+        }
+        return unknown.sorted { $0.rawValue < $1.rawValue }
     }
 
     // MARK: Queries
@@ -780,6 +1115,7 @@ actor DownloadEngine {
         machine?.defaultPolicy ?? configuration.defaultPolicy
     }
 
+    var isDetached: Bool { lifecycle == .detached }
     var activeLeaseCount: Int { leases.values.reduce(0) { $0 + $1.count } }
     var subscriberCount: Int { subscribers.count }
 

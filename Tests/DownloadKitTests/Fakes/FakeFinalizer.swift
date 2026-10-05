@@ -11,8 +11,17 @@ actor FakeFinalizer: DownloadFinalizing {
         case deferred
     }
 
+    /// Where a finalisation suspends until ``release()``, like a worker preempted mid-way.
+    enum Gate {
+        case none
+        case beforeRename
+        case afterRename
+    }
+
     private let fileSystem: FakeFileSystem
     private var mode: Mode = .finalize
+    private var gate: Gate = .none
+    private var suspended: [CheckedContinuation<Void, Never>] = []
     private(set) var requests: [FinalizationRequest] = []
 
     init(fileSystem: FakeFileSystem) {
@@ -20,9 +29,29 @@ actor FakeFinalizer: DownloadFinalizing {
     }
 
     func setMode(_ mode: Mode) { self.mode = mode }
+    func setGate(_ gate: Gate) { self.gate = gate }
+
+    /// Finalisations currently suspended at the gate.
+    var suspendedCount: Int { suspended.count }
+
+    /// Resumes every suspended finalisation and stops gating.
+    func release() {
+        gate = .none
+        let waiting = suspended
+        suspended = []
+        for continuation in waiting { continuation.resume() }
+    }
+
+    private func pause(at point: Gate) async {
+        guard gate == point else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            suspended.append(continuation)
+        }
+    }
 
     func finalize(_ request: FinalizationRequest) async -> FinalizationResult {
         requests.append(request)
+        await pause(at: .beforeRename)
         switch mode {
         case .fail(let failure):
             return .failed(failure)
@@ -36,6 +65,7 @@ actor FakeFinalizer: DownloadFinalizing {
                 case .file(let size):
                     try await fileSystem.synchronizeFile(at: captured)
                     try await fileSystem.moveItem(at: captured, to: destination)
+                    await pause(at: .afterRename)
                     return .finalized(finalPath: request.destination, integrity: IntegrityRecord(verifiedLength: size, checksum: nil))
                 case .absent:
                     guard case .file(let size) = try await fileSystem.inspectItem(at: destination) else {
