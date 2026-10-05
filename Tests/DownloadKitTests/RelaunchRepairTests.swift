@@ -4,8 +4,8 @@
 //
 //  Task and index repair on a relaunch, one interruption window each: a binding whose task is
 //  gone, a task without an index row (the package's own, and one naming another session), a
-//  capture without its journal, a journal without its capture, and a completed row without its
-//  file.
+//  capture without its journal, a journal without its capture, a completed row without its
+//  file, and a continuation the server refused, submitted again through the transfer URL hook.
 //
 
 import Foundation
@@ -123,5 +123,147 @@ final class RelaunchRepairTests: XCTestCase {
         let lookup = try await restarted.localFile(for: itemID("a"))
         XCTAssertEqual(state, .missing)
         XCTAssertEqual(lookup, .unavailable(.missing))
+    }
+
+    // MARK: Refused continuations
+
+    /// A launch that submitted "a" with a signed transfer URL, then a relaunch whose system
+    /// still runs that task. Returns the relaunched harness and the running attempt.
+    private func relaunchWithSignedAttempt(gate: SigningGate) async throws -> (harness: Harness, reference: TransferTaskReference, firstURL: URL) {
+        let first = try Harness()
+        let manager = first.makeManager(urlRefresher: GatedSigner(gate: gate))
+        try await manager.start()
+        try await manager.enqueue(makeRequest("a"))
+        let reference = try await XCTUnwrapAsync(await first.session.latestReference(for: itemID("a")))
+        let firstURL = try await XCTUnwrapAsync(await first.session.submissions.first?.url)
+        await manager.detach()
+
+        let session = FakeTransferSession(identifier: first.sessionIdentifier, liveTasks: [reference])
+        let second = try Harness(namespace: first.namespace, sessionIdentifier: first.sessionIdentifier, fileSystem: first.fileSystem, store: first.store, session: session, clock: first.clock)
+        return (second, reference, firstURL)
+    }
+
+    func testRefusedContinuationAfterARelaunchIsSubmittedAgainWithAFreshTransferURL() async throws {
+        let gate = SigningGate()
+        let (harness, reference, firstURL) = try await relaunchWithSignedAttempt(gate: gate)
+        let manager = harness.makeManager(urlRefresher: GatedSigner(gate: gate))
+        try await manager.start()
+        let handled = await harness.session.refuse(reference)
+        XCTAssertTrue(handled)
+
+        let submissions = await harness.session.submissions
+        XCTAssertEqual(submissions.count, 1)
+        let replacement = try XCTUnwrap(submissions.first)
+        XCTAssertEqual(replacement.generation, reference.generation, "the same attempt, from zero")
+        XCTAssertNil(replacement.resumeDataPath)
+        XCTAssertEqual(firstURL.query, "sig=1")
+        XCTAssertEqual(replacement.url.query, "sig=2", "resolved again for the replacement, never the expired one")
+        let bound = await harness.store.contents?.records.first?.binding?.taskIdentifier
+        let live = await harness.session.latestReference(for: itemID("a"))
+        XCTAssertEqual(bound, live?.taskIdentifier)
+        let raw = await harness.store.rawData ?? Data()
+        XCTAssertFalse(String(decoding: raw, as: UTF8.self).contains("sig="), "transfer URLs are never persisted")
+    }
+
+    func testRefusalOfAnAttemptThatIsNoLongerCurrentSubmitsNothing() async throws {
+        let gate = SigningGate()
+        let (harness, reference, _) = try await relaunchWithSignedAttempt(gate: gate)
+        let manager = harness.makeManager(urlRefresher: GatedSigner(gate: gate))
+        try await manager.start()
+
+        let stale = TransferTaskReference(itemID: reference.itemID, generation: reference.generation - 1, taskIdentifier: reference.taskIdentifier)
+        let handledStale = await harness.session.refuse(stale)
+        let otherTask = TransferTaskReference(itemID: reference.itemID, generation: reference.generation, taskIdentifier: 4_321)
+        let handledOther = await harness.session.refuse(otherTask)
+        try await manager.remove(itemID("a"))
+        let handledRemoved = await harness.session.refuse(reference)
+
+        XCTAssertTrue(handledStale)
+        XCTAssertTrue(handledOther)
+        XCTAssertTrue(handledRemoved)
+        let submissions = await harness.session.submissions
+        XCTAssertTrue(submissions.isEmpty)
+        await manager.detach()
+        let afterDetach = await harness.session.refuse(reference)
+        XCTAssertFalse(afterDetach)
+    }
+
+    func testRemovalAskedWhileTheFreshURLIsResolvedEndsTheReplacement() async throws {
+        let gate = SigningGate()
+        let (harness, reference, _) = try await relaunchWithSignedAttempt(gate: gate)
+        let manager = harness.makeManager(urlRefresher: GatedSigner(gate: gate))
+        try await manager.start()
+
+        await gate.hold()
+        let refusal = Task { await harness.session.refuse(reference) }
+        await eventually("the host is resolving a transfer URL") { await gate.waiting == 1 }
+        let removal = Task { try await manager.remove(itemID("a")) }
+        await gate.release()
+        let handled = await refusal.value
+        try await removal.value
+        XCTAssertTrue(handled)
+
+        let live = await harness.session.liveTasks.filter { $0.itemID == itemID("a") }
+        let state = await manager.snapshot(for: itemID("a"))
+        XCTAssertTrue(live.isEmpty, "nothing of the removed item keeps running")
+        XCTAssertNil(state)
+    }
+
+    func testTransferURLHookFailingForTheReplacementFailsTheAttemptAsUnauthorized() async throws {
+        let gate = SigningGate()
+        let (harness, reference, _) = try await relaunchWithSignedAttempt(gate: gate)
+        let manager = harness.makeManager(urlRefresher: GatedSigner(gate: gate, failsAfter: 1))
+        try await manager.start()
+        let handled = await harness.session.refuse(reference)
+        XCTAssertTrue(handled)
+
+        let submissions = await harness.session.submissions
+        let state = await manager.state(for: itemID("a"))
+        XCTAssertTrue(submissions.isEmpty)
+        guard case .failed(let failure) = state else { return XCTFail("expected failed, got \(state)") }
+        XCTAssertEqual(failure.kind, .unauthorized)
+    }
+}
+
+/// Counts transfer URL resolutions and can hold them.
+actor SigningGate {
+    private var count = 0
+    private var held = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    var waiting: Int { waiters.count }
+
+    func hold() { held = true }
+
+    func release() {
+        held = false
+        let resumed = waiters
+        waiters = []
+        for waiter in resumed { waiter.resume() }
+    }
+
+    func next() async -> Int {
+        count += 1
+        let number = count
+        if held {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in waiters.append(continuation) }
+        }
+        return number
+    }
+}
+
+/// Signs every attempt with a new signature; fails resolutions after `failsAfter`.
+struct GatedSigner: URLRefreshing {
+    let gate: SigningGate
+    var failsAfter: Int?
+
+    func refreshedURL(for id: DownloadID, metadata: DownloadMetadata) async throws -> URL {
+        throw FakeError.injected
+    }
+
+    func transferURL(for id: DownloadID, sourceURL: URL, metadata: DownloadMetadata) async throws -> URL {
+        let number = await gate.next()
+        if let failsAfter, number > failsAfter { throw FakeError.injected }
+        return URL(string: sourceURL.absoluteString + "?sig=\(number)")!
     }
 }

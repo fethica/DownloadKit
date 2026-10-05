@@ -188,6 +188,7 @@ actor DownloadEngine {
             lifecycle = .running
             await reconcile()
             startConsumers()
+            await connectRestarts()
         } catch {
             teardown()
             await releaseClaimIfHeld()
@@ -736,6 +737,35 @@ actor DownloadEngine {
             if let backgroundEvents { await backgroundEvents.eventsApplied(through: envelope.wakeOrder) }
             return true
         }
+    }
+
+    /// Connects the adapter's restart path: a refused continuation is submitted again from
+    /// zero by this manager, through ``submit(_:)`` and so through the host's transfer URL hook.
+    private func connectRestarts() async {
+        guard let session = session as? any RestartingTransferSession else { return }
+        await session.setRestartHandler { [weak self] reference in
+            guard let self else { return false }
+            return await self.replaceRefusedAttempt(reference)
+        }
+    }
+
+    /// Submits the attempt of a refused continuation again from zero, as a step. Returns
+    /// `false` while this manager is not running (the adapter keeps the restart for the next
+    /// one), `true` once decided: replaced, or nothing to replace because the attempt is no
+    /// longer current, no longer awaits a transfer, holds a capture or waits for reconciliation
+    /// (which then adopts a live task or resubmits under a new generation).
+    func replaceRefusedAttempt(_ reference: TransferTaskReference) async -> Bool {
+        guard lifecycle == .running else { return false }
+        let handled = try? await serialized { [self] in await self.runReplacement(reference) }
+        return handled ?? false
+    }
+
+    private func runReplacement(_ reference: TransferTaskReference) async -> Bool {
+        guard lifecycle == .running else { return false }
+        guard orphanCandidates[reference.itemID] == nil,
+              let submission = machine?.replacementSubmission(for: reference.itemID, generation: reference.generation, refusedTask: reference.taskIdentifier) else { return true }
+        await submit(submission)
+        return true
     }
 
     /// Fires every scheduled retry whose time has come.

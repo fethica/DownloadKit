@@ -22,9 +22,13 @@
 //  after its replay.
 //
 //  Restarts: a refused continuation is recorded durably inside the callback (see
-//  ``RestartIntent``) and replaced by a fresh task under the same description. After a
-//  relaunch the intents are read back: the refused task's late completion is ignored and a
-//  cancel of the refused task reaches its replacement.
+//  ``RestartIntent``) and handed to the manager, which submits a fresh request from zero for
+//  the same attempt, with a transfer URL resolved for it (never the refused task's request).
+//  The submission is mapped to the refused task. Until a running manager has taken it, the
+//  restart waits. After a relaunch the intents are read back: the refused task's late
+//  completion is ignored and a cancel of the refused task reaches its replacement. An intent
+//  read back whose refused task and replacement are both absent from the system's task list is
+//  deleted at the next backlog barrier; reconciliation then resolves the attempt.
 //
 
 import Foundation
@@ -74,12 +78,21 @@ actor TransferSessionHost {
     private var reservedSequence: UInt64 = 0
     /// Tasks whose terminal outcome was already reported; their completion callback is ignored.
     private var reportedTasks: Set<Int> = []
-    /// Submissions of running tasks, for a restart from zero.
-    private var submissions: [Int: TransferSubmission] = [:]
     /// Task identifiers the manager knows, mapped to the task that replaced them on a restart.
     private var replacements: [Int: Int] = [:]
     /// Durable restarts, by refused task, read back after a relaunch or written in this process.
     private var restarts: [Int: RestartIntent] = [:]
+    /// Restarts read back from an earlier process.
+    private var inheritedRestarts: Set<Int> = []
+    /// Refused tasks whose replacement the manager has not submitted yet.
+    private var awaitingReplacement: [Int: TransferTaskReference] = [:]
+    /// Refused tasks currently handed to the manager.
+    private var replacementInFlight: Set<Int> = []
+    /// The running manager's path for a restart: submits the replacement, returns `false` when
+    /// the manager is not running (the restart then waits for the next one).
+    private var restartHandler: (@Sendable (TransferTaskReference) async -> Bool)?
+    /// Counts handlers, so an answer from a replaced handler is asked again of the current one.
+    private var restartHandlerVersion = 0
     /// Wake markers (their order) that arrived while no manager was subscribed.
     private var owedWakeMarkers: [UInt64] = []
     private var lastProgress: [Int: Int64] = [:]
@@ -140,6 +153,7 @@ actor TransferSessionHost {
         for intent in contents.restarts {
             if tasksOutliveProcess {
                 restarts[intent.taskIdentifier] = intent
+                inheritedRestarts.insert(intent.taskIdentifier)
                 if let replacement = intent.replacement { replacements[intent.taskIdentifier] = replacement }
             } else {
                 // No task of a foreground session outlives its process.
@@ -196,10 +210,10 @@ actor TransferSessionHost {
         let queue = delegateQueue
         let channel = self.channel
         Task {
-            _ = await Self.tasks(of: session)
+            let live = Set(await Self.tasks(of: session).map(\.taskIdentifier))
             // A barrier, not an ordinary operation: it runs only after every operation queued
             // before it has finished, whatever their readiness or priority.
-            queue.addBarrierBlock { channel.yield(.barrier(token)) }
+            queue.addBarrierBlock { channel.yield(.barrier(token, liveTasks: live)) }
         }
         retryStorage()
         return stream
@@ -224,7 +238,7 @@ actor TransferSessionHost {
             task = session.downloadTask(with: Self.request(for: submission))
         }
         task.taskDescription = submission.taskDescription(sessionIdentifier: identifier)
-        submissions[task.taskIdentifier] = submission
+        linkReplacement(task.taskIdentifier, for: submission)
         task.resume()
         // The task holds its own copy of the resume data; the file is no longer needed.
         if let resumeURL { try? FileManager.default.removeItem(at: resumeURL) }
@@ -282,6 +296,7 @@ actor TransferSessionHost {
     var unacknowledgedSequences: [UInt64] { unacknowledged.map(\.sequence) }
     var pendingCount: Int { pending.count }
     var restartIntents: [RestartIntent] { restarts.values.sorted { $0.taskIdentifier < $1.taskIdentifier } }
+    var awaitingReplacementCount: Int { awaitingReplacement.count }
     func replacement(for taskIdentifier: Int) -> Int? { replacements[taskIdentifier] }
     var isInboxLoaded: Bool { loaded }
     nonisolated var callbackChannel: AsyncStream<DelegateCallback>.Continuation { channel }
@@ -340,7 +355,6 @@ actor TransferSessionHost {
 
         case .receipt(let receipt, let taskIdentifier, _):
             reportedTasks.insert(taskIdentifier)
-            submissions[taskIdentifier] = nil
             lastProgress[taskIdentifier] = nil
             finishRestarts(replacedBy: taskIdentifier)
             guard handledReceipts.insert(receipt.id).inserted, let event = receipt.event.event else { return }
@@ -358,15 +372,14 @@ actor TransferSessionHost {
             // stored before anything after it is delivered.
             deliver(event, receipt: receipt.id)
 
-        case .restart(let taskIdentifier, let description, let request):
+        case .restart(let taskIdentifier, let description):
             reportedTasks.insert(taskIdentifier)
             lastProgress[taskIdentifier] = nil
-            restart(taskIdentifier, description: description, request: request)
+            restart(taskIdentifier, description: description)
 
         case .completed(let taskIdentifier, let description, let failure):
             lastProgress[taskIdentifier] = nil
             guard reportedTasks.remove(taskIdentifier) == nil else { return }
-            submissions[taskIdentifier] = nil
             guard let reference = reference(description, taskIdentifier) else { return }
             // The refused task of a restart recorded before a relaunch: its replacement reports.
             if let intent = restarts[taskIdentifier], intent.matches(reference) { return }
@@ -378,8 +391,9 @@ actor TransferSessionHost {
             pending.append(PendingEvent(event: nil, receipt: nil, sequence: nil, wakeOrder: order))
             flushPending()
 
-        case .barrier(let token):
+        case .barrier(let token, let live):
             guard token == subscription else { return }
+            sweepInheritedRestarts(liveTasks: live)
             deliverMarker(token)
 
         case .invalidated:
@@ -388,41 +402,90 @@ actor TransferSessionHost {
         }
     }
 
-    /// Starts the attempt again from zero under the same description. The manager keeps using the
-    /// task identifier it was given; it is mapped to the replacement, durably. The request is the
-    /// submission's when this process made it, otherwise the system's copy of the refused
-    /// task's request without its range headers.
-    private func restart(_ taskIdentifier: Int, description: String?, request original: URLRequest?) {
+    /// Records the refused continuation and hands it to the manager, which submits the
+    /// attempt again from zero (``linkReplacement(_:for:)`` maps that submission). The intent
+    /// file was written inside the callback; it is completed with the replacement, or deleted
+    /// when the manager decides there is nothing to replace.
+    private func restart(_ taskIdentifier: Int, description: String?) {
         guard let reference = reference(description, taskIdentifier) else { return }
-        let request: URLRequest
-        var fresh: TransferSubmission?
-        if let submission = submissions.removeValue(forKey: taskIdentifier) {
-            let renewed = TransferSubmission(itemID: submission.itemID, generation: submission.generation, url: submission.url, policy: submission.policy, resumeDataPath: nil, expectedLength: submission.expectedLength)
-            fresh = renewed
-            request = Self.request(for: renewed)
-        } else if let original, original.url != nil {
-            request = Self.restartRequest(from: original)
-        } else {
-            inbox.removeRestart(taskIdentifier)
-            restarts[taskIdentifier] = nil
-            deliver(.failed(reference, .http(status: 416, retryAfter: nil)), receipt: nil)
-            return
+        if restarts[taskIdentifier] == nil {
+            restarts[taskIdentifier] = RestartIntent(taskIdentifier: taskIdentifier, itemID: reference.itemID.rawValue, generation: reference.generation, replacement: nil)
         }
-        let task = session.downloadTask(with: request)
-        task.taskDescription = TransferTaskReference.taskDescription(itemID: reference.itemID, generation: reference.generation, sessionIdentifier: identifier)
-        if let fresh { submissions[task.taskIdentifier] = fresh }
-        for (known, current) in replacements where current == taskIdentifier { replacements[known] = task.taskIdentifier }
-        replacements[taskIdentifier] = task.taskIdentifier
-        // Best effort: if the intent cannot be written the restart still runs in this process.
-        var intent = restarts[taskIdentifier] ?? RestartIntent(taskIdentifier: taskIdentifier, itemID: reference.itemID.rawValue, generation: reference.generation, replacement: nil)
-        intent.replacement = task.taskIdentifier
-        restarts[taskIdentifier] = intent
-        try? inbox.write(intent)
-        task.resume()
+        awaitingReplacement[taskIdentifier] = reference
         // The refused task normally ended already; make sure it cannot report anything else.
         let session = self.session
         Task {
             await Self.tasks(of: session).first { $0.taskIdentifier == taskIdentifier }?.cancel()
+        }
+        requestReplacement(taskIdentifier)
+    }
+
+    /// Connects the running manager's restart path and hands it every restart still waiting.
+    func setRestartHandler(_ handler: @escaping @Sendable (TransferTaskReference) async -> Bool) {
+        restartHandler = handler
+        restartHandlerVersion += 1
+        for taskIdentifier in awaitingReplacement.keys.sorted() { requestReplacement(taskIdentifier) }
+    }
+
+    private func requestReplacement(_ taskIdentifier: Int) {
+        guard let handler = restartHandler, let reference = awaitingReplacement[taskIdentifier],
+              replacementInFlight.insert(taskIdentifier).inserted else { return }
+        let version = restartHandlerVersion
+        Task { [weak self] in
+            let handled = await handler(reference)
+            await self?.replacementRequested(taskIdentifier, handled: handled, version: version)
+        }
+    }
+
+    private func replacementRequested(_ taskIdentifier: Int, handled: Bool, version: Int) {
+        replacementInFlight.remove(taskIdentifier)
+        guard handled else {
+            // A manager that stopped answered; one connected meanwhile is asked now.
+            if version != restartHandlerVersion { requestReplacement(taskIdentifier) }
+            return
+        }
+        guard awaitingReplacement.removeValue(forKey: taskIdentifier) != nil else { return }
+        // The manager submitted nothing: the attempt changed, ended or is resolved by
+        // reconciliation. The refused task has ended, so its intent is done.
+        if restarts[taskIdentifier]?.replacement == nil {
+            restarts[taskIdentifier] = nil
+            inbox.removeRestart(taskIdentifier)
+        }
+    }
+
+    /// A submission for the attempt of a refused task is its replacement: the manager keeps
+    /// using the refused task's identifier until it bound the new one, so it is mapped, durably.
+    private func linkReplacement(_ replacement: Int, for submission: TransferSubmission) {
+        let refused = awaitingReplacement.filter { $0.value.itemID == submission.itemID && $0.value.generation == submission.generation }.keys
+        for taskIdentifier in refused.sorted() {
+            awaitingReplacement[taskIdentifier] = nil
+            for (known, current) in replacements where current == taskIdentifier { replacements[known] = replacement }
+            replacements[taskIdentifier] = replacement
+            var intent = restarts[taskIdentifier] ?? RestartIntent(taskIdentifier: taskIdentifier, itemID: submission.itemID.rawValue, generation: submission.generation, replacement: nil)
+            intent.replacement = replacement
+            restarts[taskIdentifier] = intent
+            // Best effort: if the intent cannot be written the mapping still holds in this process.
+            try? inbox.write(intent)
+        }
+    }
+
+    /// Deletes restart intents read back from an earlier process whose refused task and
+    /// replacement are both absent from the system's task list, taken before the backlog
+    /// barrier: neither can report anything any more, and reconciliation resolves the attempt
+    /// (adopting a live task of it, or resubmitting under a new generation).
+    func sweepInheritedRestarts(liveTasks: Set<Int>) {
+        guard loaded else { return }
+        for taskIdentifier in inheritedRestarts.sorted() {
+            guard let intent = restarts[taskIdentifier] else {
+                inheritedRestarts.remove(taskIdentifier)
+                continue
+            }
+            let replacementLive = intent.replacement.map(liveTasks.contains) ?? false
+            guard !liveTasks.contains(taskIdentifier), !replacementLive, awaitingReplacement[taskIdentifier] == nil else { continue }
+            inheritedRestarts.remove(taskIdentifier)
+            restarts[taskIdentifier] = nil
+            replacements[taskIdentifier] = nil
+            inbox.removeRestart(taskIdentifier)
         }
     }
 
@@ -437,15 +500,6 @@ actor TransferSessionHost {
     /// The task's item and attempt in this session, `nil` for a foreign task.
     private func reference(_ description: String?, _ taskIdentifier: Int) -> TransferTaskReference? {
         TransferTaskReference(taskDescription: description, taskIdentifier: taskIdentifier, sessionIdentifier: identifier)
-    }
-
-    /// A refused continuation's request, as a fresh request from zero.
-    static func restartRequest(from original: URLRequest) -> URLRequest {
-        var request = original
-        request.setValue(nil, forHTTPHeaderField: "Range")
-        request.setValue(nil, forHTTPHeaderField: "If-Range")
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        return request
     }
 
     // MARK: Emitting

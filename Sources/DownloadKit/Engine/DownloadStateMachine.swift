@@ -133,6 +133,24 @@ struct DownloadStateMachine: Sendable, Equatable {
         record.policy ?? defaultPolicy
     }
 
+    /// A request from zero for the current attempt, after the server refused its continuation
+    /// on `refusedTask`: same generation, no resume data, the persisted source URL. `nil` when
+    /// that attempt is not current any more, no longer awaits a transfer, holds a capture or is
+    /// bound to another task.
+    func replacementSubmission(for id: DownloadID, generation: UInt64, refusedTask: Int) -> TransferSubmission? {
+        guard let record = records[id], record.generation == generation, record.phase.isAwaitingTransfer,
+              record.journal != .captured else { return nil }
+        if let binding = record.binding, binding.taskIdentifier != refusedTask { return nil }
+        return TransferSubmission(
+            itemID: id,
+            generation: generation,
+            url: record.request.sourceURL,
+            policy: effectivePolicy(for: record),
+            resumeDataPath: nil,
+            expectedLength: record.request.expectedLength
+        )
+    }
+
     func snapshot(for id: DownloadID) -> DownloadSnapshot? {
         records[id]?.snapshot
     }

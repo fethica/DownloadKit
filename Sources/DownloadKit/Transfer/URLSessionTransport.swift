@@ -37,7 +37,9 @@ import Foundation
 ///   network flags are no more permissive than the item's policy; otherwise the attempt starts
 ///   from zero. A continuation the server refuses (416) or answers with another representation
 ///   is started again from zero, never appended. That restart is recorded in the inbox inside
-///   the callback, so a relaunch neither loses it nor turns it into a failure.
+///   the callback, so a relaunch does not turn it into a failure, and the replacement is
+///   submitted by the running manager with a transfer URL resolved for it, exactly like any
+///   other attempt; the refused task's request is never reused.
 /// - Tasks the package did not create are listed by ``TransferSession/systemTasks()`` and
 ///   never cancelled, captured or reported.
 /// - No URL, header or credential is written by the adapter or logged; the transfer URL of
@@ -205,8 +207,16 @@ actor TransferHostRegistry {
     }
 }
 
+/// A session that starts a refused continuation again through the manager, so the replacement
+/// gets a transfer URL resolved for it.
+protocol RestartingTransferSession: TransferSession {
+    /// `handler` submits the attempt of the refused task again from zero; it returns `false`
+    /// when the manager is not running.
+    func setRestartHandler(_ handler: @escaping @Sendable (TransferTaskReference) async -> Bool) async
+}
+
 /// One manager's view of a host.
-struct URLSessionTransferSession: TransferSession {
+struct URLSessionTransferSession: RestartingTransferSession {
     let identifier: String
     let events: AsyncStream<TransferSessionEvent>
     let host: TransferSessionHost
@@ -225,5 +235,9 @@ struct URLSessionTransferSession: TransferSession {
 
     func acknowledge(through sequence: UInt64) async {
         await host.acknowledge(through: sequence)
+    }
+
+    func setRestartHandler(_ handler: @escaping @Sendable (TransferTaskReference) async -> Bool) async {
+        await host.setRestartHandler(handler)
     }
 }

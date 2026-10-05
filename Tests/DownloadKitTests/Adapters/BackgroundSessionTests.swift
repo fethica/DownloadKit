@@ -17,6 +17,15 @@ import Foundation
 import XCTest
 @testable import DownloadKit
 
+/// Collects the references a restart handler was asked about.
+actor ReferenceBox {
+    private(set) var references: [TransferTaskReference] = []
+
+    func append(_ reference: TransferTaskReference) {
+        references.append(reference)
+    }
+}
+
 final class BackgroundSessionTests: XCTestCase {
     private var directory: TemporaryDirectory!
     private var transports: [URLSessionTransport] = []
@@ -210,7 +219,7 @@ final class BackgroundSessionTests: XCTestCase {
 
     // MARK: Restarts across a relaunch
 
-    func testRestartOfATaskFromAnEarlierLaunchUsesTheSystemsRequestAndNeverFails() async throws {
+    func testRestartOfATaskFromAnEarlierLaunchWaitsForTheManagerAndUsesItsFreshRequest() async throws {
         let transport = makeTransport()
         let identifier = Harness.uniqueName("session")
         let session = try await transport.makeSession(identifier: identifier, storageRoot: root)
@@ -218,13 +227,22 @@ final class BackgroundSessionTests: XCTestCase {
         _ = await recorder.wait { $0.hasBacklogMarker }
         let host = try await XCTUnwrapAsync(await transport.host(for: identifier))
 
-        // A continuation submitted by an earlier process was refused: this process never saw
-        // its submission, only the system's copy of the request.
-        var refused = URLRequest(url: StubRoute.url("/ok", size: 2_000))
-        refused.setValue("bytes=1000-", forHTTPHeaderField: "Range")
-        refused.setValue("\"v1\"", forHTTPHeaderField: "If-Range")
+        // A continuation submitted by an earlier process was refused. No manager runs yet: the
+        // restart waits, recorded, and nothing is resubmitted from the refused request.
         let description = TransferTaskReference.taskDescription(itemID: itemID("r"), generation: 5, sessionIdentifier: identifier)
-        await host.inject(.restart(taskIdentifier: 4_242, description: description, request: refused))
+        await host.inject(.restart(taskIdentifier: 4_242, description: description))
+        await realTimeEventually("the restart waits for a manager") { await host.awaitingReplacementCount == 1 }
+        let waiting = await host.restartIntents
+        XCTAssertEqual(waiting, [RestartIntent(taskIdentifier: 4_242, itemID: "r", generation: 5, replacement: nil)])
+
+        // The manager submits the attempt again with a transfer URL resolved now.
+        let asked = ReferenceBox()
+        let fresh = TransferSubmission(itemID: itemID("r"), generation: 5, url: StubRoute.url("/ok", size: 2_000), policy: .default, resumeDataPath: nil, expectedLength: nil)
+        await host.setRestartHandler { reference in
+            await asked.append(reference)
+            _ = try? await session.submit(fresh)
+            return true
+        }
 
         let finished = await recorder.wait { $0.terminalCount >= 1 }
         XCTAssertTrue(finished)
@@ -234,13 +252,37 @@ final class BackgroundSessionTests: XCTestCase {
         XCTAssertEqual(reference.itemID, itemID("r"))
         XCTAssertEqual(reference.generation, 5, "the same attempt, started from zero")
         XCTAssertEqual(bytes, 2_000, "the whole body, not a continuation")
+        let references = await asked.references
+        XCTAssertEqual(references, [TransferTaskReference(itemID: itemID("r"), generation: 5, taskIdentifier: 4_242)])
         let replacement = await host.replacement(for: 4_242)
-        XCTAssertEqual(replacement, reference.taskIdentifier)
+        XCTAssertEqual(replacement, reference.taskIdentifier, "a cancel of the refused task reaches its replacement")
         await realTimeEventually("the finished restart is forgotten") { await host.restartIntents.isEmpty }
+    }
 
-        let plain = TransferSessionHost.restartRequest(from: refused)
-        XCTAssertNil(plain.value(forHTTPHeaderField: "Range"))
-        XCTAssertNil(plain.value(forHTTPHeaderField: "If-Range"))
+    func testRestartTheManagerDeclinesDeletesItsIntentAndAStoppedManagerLeavesItWaiting() async throws {
+        let transport = makeTransport()
+        let identifier = Harness.uniqueName("session")
+        let session = try await transport.makeSession(identifier: identifier, storageRoot: root)
+        let recorder = EventRecorder.record(session)
+        _ = await recorder.wait { $0.hasBacklogMarker }
+        let host = try await XCTUnwrapAsync(await transport.host(for: identifier))
+        let inbox = TransferInbox(storageRoot: root, sessionIdentifier: identifier)
+
+        // A detached manager answers false: the restart keeps waiting for the next one.
+        await host.setRestartHandler { _ in false }
+        try inbox.write(RestartIntent(taskIdentifier: 31, itemID: "r", generation: 2, replacement: nil))
+        await host.inject(.restart(taskIdentifier: 31, description: TransferTaskReference.taskDescription(itemID: itemID("r"), generation: 2, sessionIdentifier: identifier)))
+        await realTimeEventually("waiting") { await host.awaitingReplacementCount == 1 }
+        let kept = try FileManager.default.contentsOfDirectory(atPath: inbox.restarts.path)
+        XCTAssertEqual(kept.count, 1)
+
+        // The next manager finds the attempt changed: nothing is submitted, the intent is done.
+        await host.setRestartHandler { _ in true }
+        await realTimeEventually("decided") { await host.awaitingReplacementCount == 0 }
+        await realTimeEventually("intent deleted") { await host.restartIntents.isEmpty }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: inbox.restarts.path), [])
+        let terminal = await recorder.terminalEvents
+        XCTAssertTrue(terminal.isEmpty, "the refused task reports nothing")
     }
 
     func testRestartIntentSurvivesARelaunch() async throws {
@@ -253,10 +295,6 @@ final class BackgroundSessionTests: XCTestCase {
 
         let host = try TransferSessionHost(identifier: identifier, storageRoot: root, options: Self.stubOptions, tasksOutliveProcess: true)
         await host.start()
-        let stream = await host.subscribe()
-        let recorder = EventRecorder()
-        Task { for await event in stream { await recorder.append(event) } }
-        _ = await recorder.wait { $0.hasBacklogMarker }
         let intents = await host.restartIntents
         let replacement = await host.replacement(for: 4_242)
         XCTAssertEqual(intents.map(\.taskIdentifier), [4_242])
@@ -266,12 +304,45 @@ final class BackgroundSessionTests: XCTestCase {
         await host.inject(.completed(taskIdentifier: 4_242, description: description, failure: nil))
         // The replacement then fails for real; that is reported, and the restart is finished.
         await host.inject(.completed(taskIdentifier: 77, description: description, failure: .network(code: -1009)))
+        let stream = await host.subscribe()
+        let recorder = EventRecorder()
+        Task { for await event in stream { await recorder.append(event) } }
         let reported = await recorder.wait { $0.terminalCount >= 1 }
         XCTAssertTrue(reported)
         let terminal = await recorder.terminalEvents
         XCTAssertEqual(terminal, [.failed(TransferTaskReference(itemID: itemID("r"), generation: 5, taskIdentifier: 77), .network(code: -1009))])
         await realTimeEventually("restart finished") { await host.restartIntents.isEmpty }
         XCTAssertTrue(((try? FileManager.default.contentsOfDirectory(atPath: inbox.restarts.path)) ?? ["x"]).isEmpty)
+        await host.invalidate(cancellingTasks: true)
+    }
+
+    func testInheritedRestartIsDeletedOnceNeitherOfItsTasksIsListed() async throws {
+        let identifier = Harness.uniqueName("session")
+        let inbox = TransferInbox(storageRoot: root, sessionIdentifier: identifier)
+        try inbox.prepare()
+        // The process ended after the intent was written and before the replacement existed.
+        try inbox.write(RestartIntent(taskIdentifier: 4_242, itemID: "r", generation: 5, replacement: nil))
+        // Another restart whose replacement still runs.
+        try inbox.write(RestartIntent(taskIdentifier: 5_000, itemID: "s", generation: 3, replacement: 77))
+
+        let host = try TransferSessionHost(identifier: identifier, storageRoot: root, options: Self.stubOptions, tasksOutliveProcess: true)
+        await host.start()
+        await host.sweepInheritedRestarts(liveTasks: [77])
+        let kept = await host.restartIntents
+        XCTAssertEqual(kept.map(\.taskIdentifier), [5_000], "kept while a task of it may still report")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: inbox.restarts.path).count, 1)
+
+        // At the backlog barrier the system lists neither task: nothing of it can report any
+        // more, and reconciliation resolves the attempt.
+        let stream = await host.subscribe()
+        let recorder = EventRecorder()
+        Task { for await event in stream { await recorder.append(event) } }
+        _ = await recorder.wait { $0.hasBacklogMarker }
+        let left = await host.restartIntents
+        let mapped = await host.replacement(for: 5_000)
+        XCTAssertEqual(left, [])
+        XCTAssertNil(mapped)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: inbox.restarts.path), [])
         await host.invalidate(cancellingTasks: true)
     }
 

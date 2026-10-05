@@ -7,7 +7,7 @@ import Foundation
 /// them exactly as it would map system tasks. Events are sequence-numbered; a backlog given
 /// at creation is delivered first, followed by the backlog marker unless the session is told
 /// to withhold it (a compliant session whose marker is late).
-actor FakeTransferSession: TransferSession {
+actor FakeTransferSession: RestartingTransferSession {
     struct Cancellation: Equatable {
         let taskIdentifier: Int
         let producingResumeData: Bool
@@ -25,6 +25,7 @@ actor FakeTransferSession: TransferSession {
     private var nextTaskIdentifier = 100
     private var nextSequence: UInt64 = 0
     private var submitFailure: TransferFailure?
+    private var restartHandler: (@Sendable (TransferTaskReference) async -> Bool)?
     private let log: CallLog?
 
     init(
@@ -86,6 +87,21 @@ actor FakeTransferSession: TransferSession {
 
     func acknowledge(through sequence: UInt64) {
         acknowledged = sequence
+    }
+
+    func setRestartHandler(_ handler: @escaping @Sendable (TransferTaskReference) async -> Bool) {
+        restartHandler = handler
+    }
+
+    var hasRestartHandler: Bool { restartHandler != nil }
+
+    /// The server refused the continuation of `reference`'s task: the task ended and the
+    /// manager is asked for a replacement, as the URLSession adapter does. Returns the
+    /// manager's answer (`false` without a running manager).
+    func refuse(_ reference: TransferTaskReference) async -> Bool {
+        liveTasks.removeAll { $0.taskIdentifier == reference.taskIdentifier }
+        guard let restartHandler else { return false }
+        return await restartHandler(reference)
     }
 
     /// The reference of the most recent submission for `id`.

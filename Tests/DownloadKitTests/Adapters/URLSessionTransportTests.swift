@@ -218,7 +218,13 @@ final class URLSessionTransportTests: XCTestCase {
         await realTimeEventually("the first request arrived") { slowRequestHasArrived() }
         let host = try await XCTUnwrapAsync(await transport.host(for: session.identifier))
 
-        // The server answered the continuation with 416: the adapter starts again from zero.
+        // The server answered the continuation with 416: the manager (here, the test) submits
+        // the attempt again from zero, and the adapter maps it to the refused task.
+        let fresh = submission("/slow", size: 4_096)
+        await host.setRestartHandler { _ in
+            _ = try? await session.submit(fresh)
+            return true
+        }
         await host.inject(.restart(taskIdentifier: original, description: submission("/slow").taskDescription))
         slowFirstByteGate.signal()
         await realTimeEventually("the replacement request arrived") { slowRequestHasArrived() }
@@ -231,6 +237,8 @@ final class URLSessionTransportTests: XCTestCase {
         guard case .finished(let reference, _, _, _) = terminal.first else { return XCTFail("\(terminal)") }
         XCTAssertEqual(reference.generation, 1)
         XCTAssertNotEqual(reference.taskIdentifier, original)
+        let replacement = await host.replacement(for: original)
+        XCTAssertEqual(replacement, reference.taskIdentifier)
     }
 
     func testPolicyIsAppliedToEachRequest() {

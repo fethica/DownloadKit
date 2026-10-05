@@ -21,17 +21,17 @@ enum DelegateCallback: Sendable {
     /// receipt could not be written; the session then has to store the event before anything
     /// else is delivered.
     case receipt(CaptureReceipt, taskIdentifier: Int, durable: Bool)
-    /// The continuation of a resumed task cannot be trusted; start it again from zero.
-    /// `request` is the system's copy of the task's request, used when the submission is not
-    /// known in this process (the task was created before a relaunch).
-    case restart(taskIdentifier: Int, description: String?, request: URLRequest? = nil)
+    /// The continuation of a resumed task cannot be trusted; start it again from zero. The
+    /// replacement's request is built by the manager, with a transfer URL resolved for it.
+    case restart(taskIdentifier: Int, description: String?)
     case completed(taskIdentifier: Int, description: String?, failure: TransferFailure?)
     /// The system delivered every event of a background wake
     /// (`urlSessionDidFinishEvents(forBackgroundURLSession:)`). `order` places it among the
     /// host's accepted wake handlers, taken inside the callback.
     case eventsFinished(order: UInt64)
-    /// Every callback queued before this one has been forwarded.
-    case barrier(UUID)
+    /// Every callback queued before this one has been forwarded. `liveTasks` are the
+    /// identifiers of the system's tasks, listed before the barrier was queued.
+    case barrier(UUID, liveTasks: Set<Int>)
     case invalidated
 }
 
@@ -154,7 +154,7 @@ final class TransferDelegate: NSObject, URLSessionDownloadDelegate, Sendable {
         case .receipt(let receipt, let durable):
             channel.yield(.receipt(receipt, taskIdentifier: downloadTask.taskIdentifier, durable: durable))
         case .restart:
-            channel.yield(.restart(taskIdentifier: downloadTask.taskIdentifier, description: downloadTask.taskDescription, request: downloadTask.originalRequest ?? downloadTask.currentRequest))
+            channel.yield(.restart(taskIdentifier: downloadTask.taskIdentifier, description: downloadTask.taskDescription))
         }
     }
 
