@@ -9,7 +9,9 @@ DownloadKit is a durable downloader for finite media files (episodes, tracks, le
 | Product | Depends on | Purpose |
 | --- | --- | --- |
 | `DownloadKit` | Foundation | `DownloadManager`, value types, state machine, persistence types, dependency protocols |
-| `DownloadKitUI` | `DownloadKit`, SwiftUI | Optional presentation. Currently a single `DownloadListModel` placeholder |
+| `DownloadKitUI` | `DownloadKit`, SwiftUI | Optional presentation: a list model, download controls, a downloads list, a network policy picker and a status banner (see [SwiftUI](#swiftui)) |
+
+Neither product depends on a player: `DownloadKitUI` imports SwiftUI, Foundation and the core only, and the core does not import SwiftUI. The [sample app](#sample-app) adds playback at the app level.
 
 The core imports Foundation, plus two system libraries in one file each: SQLite3 for the index store and CryptoKit for checksums. It never creates a player, never configures an audio session and has no dependency on any playback library; a host resolves a completed file with `localFile(for:)` and plays it however it likes.
 
@@ -143,6 +145,77 @@ What the system does with a background session, and what the package does in eac
 
 What the tests prove and what they do not. The macOS tests prove the package's side: the configuration each mode builds, task descriptions and their session check, the order of the wake marker against stored events, restart records across a relaunch, the receiver's exactly-once handling (before the manager exists, before and after start, duplicates, unrelated identifiers, markers before and after the budget, events buffered before start, the main thread), and repair of every interruption window between intent, task, capture, rename and index commit. They do not run a background transfer: a background session's transfers run in a system process that URLProtocol stubs cannot reach, and macOS does not reproduce iOS suspension, relaunch, force-quit, reboot or file protection. Only hardware can show those, together with the effect of file protection on the created directories and the classification of protection errors, the interaction of request and session network flags on real cellular, expensive and constrained paths, discretionary scheduling under energy restrictions, and system resume data (the fixture cannot produce it, so range continuations are tested at the response-rule level).
 
+## SwiftUI
+
+`DownloadKitUI` is optional and iOS 15+ (availability-gated). It presents a manager the host owns; nothing in it starts, detaches or releases the manager, so leaving a screen never affects transfers.
+
+```swift
+import DownloadKitUI
+
+struct DownloadsScreen: View {
+    @StateObject private var downloads: DownloadListModel
+
+    init(manager: DownloadManager) {
+        _downloads = StateObject(wrappedValue: DownloadListModel(controller: manager))
+    }
+
+    var body: some View {
+        DownloadList(model: downloads)
+            .task { await downloads.observe() }   // one subscription while visible
+    }
+}
+```
+
+**What it offers.**
+
+- `DownloadListModel`: a main-actor `ObservableObject` over the snapshot stream. `observe()` is one subscription that ends when its task is cancelled (SwiftUI cancels `.task` when the view disappears) or the stream ends. It publishes `items` only when the presentation changed: progress is rounded to 1% and byte counts to 64 KiB (both configurable), on top of the stream's own throttling. Commands (`perform(_:on:)`) ignore a second tap while one is in flight for the same item; removal asks for confirmation first (`requestRemoval(of:title:)`, `confirmRemoval()`) and always passes explicit identifiers. `openLocalFile(for:)` returns a lease that the host ends with `endAccess(_:)` or `endAllAccess()`; it is not ended when a view disappears, because playback may outlive the view, and it never fetches. Failures keep only a reason (`DownloadCommandFailure.Reason`), never identifiers, paths or URLs.
+- `DownloadButton`: one control per item that shows its state (not downloaded, queued, downloading with progress or indeterminate, waiting with its reason, paused, failed with its kind, downloaded, removing, missing) and performs the state's primary action on tap: download (through a closure, because only the host can build the request), pause, resume or retry. Every action, removal included, is in its context menu.
+- `DownloadList`: the banner, one section per metadata group (with a confirmed "Remove All" that removes the group's members), a row per item with swipe, context-menu and VoiceOver actions, and the removal and failure dialogs.
+- `NetworkPolicyPicker`: the default policy among unmetered networks, unmetered including Low Data Mode, and any network. A custom policy set by the host is shown as such and is not overwritten until the person picks one. There is no Wi-Fi option, because the package cannot prove a network is Wi-Fi.
+- `ReconciliationBanner`: restoring, unconfirmed items (`unresolved`), unreadable transfer storage (`sessionStorageFailed`) and a start failure the host reports with `reportStartFailure(_:)`.
+- `DownloadControlling`: the protocol the model talks to. `DownloadManager` conforms; a host can wrap it, and tests use a fake.
+- `DiagnosticRedaction.redact(_:)`: removes URLs and absolute paths from text before a host displays it, for example in a diagnostics screen.
+
+**Strings and theming.** Every string comes from the package's English `Localizable.strings`. A host overrides any key by adding a `DownloadKitUI.strings` table to its app bundle (localised as usual), or by setting `.environment(\.downloadStrings, DownloadStrings { key in ... })` for a lookup of its own; the keys are listed in `DownloadStringKey`. The controls use system fonts, `accentColor`, semantic colors and SF Symbols, so `.tint`, `.font` and the color scheme theme them; for a different layout, build views on `DownloadListModel` and `DownloadIndicator` directly.
+
+**Accessibility.** The status indicator is one element labelled "Download status" whose value is the full status ("Downloading, 42%", "Waiting for an allowed network", "Failed: not enough storage"); every state has its own symbol, so color is never the only cue. Buttons are labelled with the action and the item ("Pause Tone A") and carry a hint. A row is one VoiceOver element read as title, subtitle, then status, with its actions in the actions rotor instead of separate stops. Sizes follow Dynamic Type (`@ScaledMetric`, text styles, no fixed widths); at accessibility sizes the row drops the indicator and shows the action as text so nothing is truncated. Layouts use leading and trailing alignment and the progress ring is mirrored in right-to-left languages. These were checked in code and in the model tests, not with VoiceOver on a device.
+
+## Sample app
+
+`sample/` holds a small iOS app that consumes the package like any other app, through its public API only, and a fixture server for it.
+
+```sh
+cd sample
+xcodegen generate                      # creates DownloadKitSample.xcodeproj (not committed)
+open DownloadKitSample.xcodeproj
+
+cd fixture-server                      # in another terminal, on the Mac
+swift run -c release fixture-server    # serves on 0.0.0.0:8080 and prints the Mac's LAN address
+```
+
+In the simulator the app reaches the server on `127.0.0.1:8080`; on a device, enter the Mac's address in the Developer tab. The app's Info.plist allows plain HTTP to local hosts only (`NSAllowsLocalNetworking`) and asks for local network access; the package itself relaxes nothing.
+
+**The app.** A SwiftUI app whose `@UIApplicationDelegateAdaptor` delegate creates a `BackgroundTransferEvents` and one `DownloadManager` at every launch (background session, `Application Support/sample/`, unmetered default policy), starts it, and forwards `handleEventsForBackgroundURLSession`. Four tabs:
+
+- **Fixtures**: every fixture with a `DownloadButton` (enqueue, progress, pause, resume, retry; long press for cancel and remove), the network policy picker and the banner. Items carry the server's recorded SHA-256, so a changed byte fails validation.
+- **Downloads**: the ready-made `DownloadList`, grouped by Tones, Large files and Scenarios.
+- **Play**: completed-only local playback through FRadioPlayer, an optional dependency of the sample only (`from: 0.4.0` in `project.yml`; remove it and the screen explains what is missing). The file is resolved through a lease and the lease ends when playback stops. With "Offline only" on, an item without a validated local file is reported and nothing is fetched; with it off, the app streams the server's copy after saying why the local file was not used. Artwork lookups are turned off.
+- **Developer**: the server address, scenario switches sent to the server's control endpoint, the manager's reconciliation status, waiting wake handlers, unreferenced files, "Flush pending work", the session's network setting (applied at the next launch), a debug-only "Exit now" to end the process mid-transfer, and an event log. The log is kept across launches, so a background relaunch can be read afterwards, and every entry goes through `DiagnosticRedaction`.
+
+**The fixture server** is a separate Swift package in `sample/fixture-server` (Foundation only, macOS 13+, `swift build` and `swift test` there); it is not part of the library products. It generates its files at start-up from fixed parameters (documented in `Fixtures.swift`): three 3-second tones and a 60-second tone as 16-bit mono WAV at 22,050 Hz, and a 24 MiB pseudo-random file, and checks them against the recorded SHA-256 values the app uses. `--write DIR` writes them and a `manifest.json` instead of serving. Routes:
+
+| Route | Response |
+| --- | --- |
+| `/files/<name>` | 200, single ranges answered with 206 (`If-Range` honoured), or the scenario set for the file |
+| `/s/<scenario>/<name>` | the named scenario |
+| `/control/set?file=<name>&scenario=<s>[&times=<n>]` | serve `<name>` with `<s>` for the next `n` requests, or until cleared (GET or POST) |
+| `/control/clear[?file=<name>]`, `/control/state`, `/control/scenarios` | clear, inspect and list |
+| `/manifest.json` | names, lengths, digests, generator parameters |
+
+Scenarios: `ok`, `ignore-range` (200 to a range request), `range-416`, `changing-etag` (a new validator on every response), `redirect`, `no-length`, `slow-first-byte` (8 s), `slow-body` (64 KiB/s), `disconnect` (reset after 40%), `truncated` (1 KiB short, clean close), `not-found`, `server-error` (500, Retry-After 3), `unavailable` (503, Retry-After 10), `html`, `html-as-media` (an HTML page declared as audio), `checksum-mismatch` (one byte changed), `expired` (403; the app's `URLRefreshing` returns the plain file on retry) and `unauthorized` (401). Normal responses are sent at 1 MiB/s by default (`--rate`), so progress and pause are visible.
+
+**What the sample proves, and what it does not.** It compiles as an independent consumer of both products and the optional player against the public API, and its wiring is the one documented above. It has not been run on hardware: background completion, relaunch after "Exit now", force-quit, reboot, network transitions and audible playback are all still to be observed on a device, using the event log as evidence. The simulator does not reproduce a device's suspension or relaunch behaviour.
+
 ## Concepts
 
 ### Lifecycle and ownership
@@ -227,6 +300,8 @@ The adapter tests use real files in a temporary directory:
 - relaunch sequencing through the manager: the wake handler forwarded before the manager exists, before and after start, twice, for another identifier, with the wake's events buffered before start, with the marker before or after the budget or never, and on the main thread; task and index repair for a binding whose task is gone, a task without an index row (the package's own, and one naming another session), a capture without its journal, a journal without its capture and a completed row without its file;
 - the transfer adapter's storage: real permission faults on the receipt, event and reservation writes interrupting the production capture pipeline (including a relaunch in between), corrupt or unreadable inbox entries, the delegate-queue barrier against an older operation that is not ready, and symbolic links in place of `transfer/`, `staging/` and resume data;
 - end to end through the manager on the production adapters: completion and offline lookup across a restart, checksum mismatch, error pages, retries, refreshed URLs, a denied write, cancel before the first byte, external deletion, a protected file, a lease across removal, and recovery from seeded crash states (after capture, between rename and commit, a committed record whose file is gone) plus two that run the production operations (between commit and acknowledgement with acknowledgements suppressed, an index write that returns an error).
+
+The `DownloadKitUITests` target tests the presentation model against a scripted controller (state mapping for every state, coalesced publishing, cancellation and release of observations, command forwarding and in-flight suppression, confirmed and group removal, policy choices, banners, failure reasons, strings and redaction) and its lease handling against a real manager on the production adapters. There is no UI snapshot test. The fixture server has its own tests (`swift test` in `sample/fixture-server`).
 
 The transfer and end-to-end tests wait on URLSession's own threads with bounded real-time polling. They do not run a background session's transfers or an iOS device; relaunches are simulated by a fresh transport or manager over the same files.
 
