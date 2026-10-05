@@ -20,9 +20,9 @@ public enum FileStatus: Hashable, Sendable {
 
 /// The file operations the manager and its finaliser perform.
 ///
-/// Every operation works on URLs under the resolved storage root. The production adapter will
-/// use `FileManager`, set `isExcludedFromBackup`, apply explicit file protection and reject
-/// paths that escape the root. It is not implemented yet.
+/// Every operation works on URLs under the resolved storage root. The production adapter is
+/// ``LocalFileSystem``: `FileManager` and POSIX calls, backup exclusion, explicit file protection
+/// on created directories, and refusal of paths that escape the root.
 ///
 /// Capturing a finished download's temporary file is not part of this port: it must happen
 /// synchronously inside the system callback, so it belongs to the transfer session adapter.

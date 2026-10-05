@@ -15,8 +15,8 @@ import Foundation
 /// - ``apply(_:)`` is atomic: all of the change set or none of it.
 /// - Paths are stored exactly as the relative paths given.
 ///
-/// The production store will be SQLite (system library, one connection confined to one
-/// actor, schema version in the database header). It is not implemented yet.
+/// The production store is ``SQLiteIndexStore`` (system SQLite library, one connection
+/// confined to one actor, schema version in its own table).
 public protocol DownloadIndexStore: Sendable {
     func load() async throws -> IndexContents?
     func apply(_ changes: IndexChangeSet) async throws

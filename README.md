@@ -2,7 +2,7 @@
 
 DownloadKit is a durable downloader for finite media files (episodes, tracks, lectures) on iOS: a headless core built on Foundation and Swift concurrency, and an optional SwiftUI layer.
 
-> **Status: contracts and state model only.** The public API, the state machine, the persistence specification and the injectable dependencies are in place and tested. No transfer adapter exists yet: there is no URLSession integration, no SQLite index and no file-system adapter, so the package cannot download anything on its own. Nothing is published; there is no release or tag.
+> **Status: foreground downloads.** The public API, the state machine and the production adapters for a foreground session are in place: a URLSession transfer adapter, a SQLite index, a file-system adapter and a validating finaliser. They are tested on macOS with an in-process HTTP fixture. Background transfers, relaunch handling and file protection are not implemented or not proven on iOS yet (see [Integration](#integration)). Nothing is published; there is no release or tag.
 
 ## Products
 
@@ -11,7 +11,7 @@ DownloadKit is a durable downloader for finite media files (episodes, tracks, le
 | `DownloadKit` | Foundation | `DownloadManager`, value types, state machine, persistence types, dependency protocols |
 | `DownloadKitUI` | `DownloadKit`, SwiftUI | Optional presentation. Currently a single `DownloadListModel` placeholder |
 
-The core imports Foundation only. It never creates a player, never configures an audio session and has no dependency on any playback library; a host resolves a completed file with `localFile(for:)` and plays it however it likes.
+The core imports Foundation, plus two system libraries in one file each: SQLite3 for the index store and CryptoKit for checksums. It never creates a player, never configures an audio session and has no dependency on any playback library; a host resolves a completed file with `localFile(for:)` and plays it however it likes.
 
 ## Requirements
 
@@ -37,7 +37,11 @@ import DownloadKit
 let configuration = try DownloadConfiguration(
     storageScope: StorageScope(namespace: "com.example.player.downloads"),
     sessionIdentifier: "com.example.player.downloads.session",
-    dependencies: dependencies          // transport, index store, file system, clock, jitter
+    dependencies: DownloadDependencies(
+        transport: URLSessionTransport(),           // foreground session in this version
+        makeIndexStore: SQLiteIndexStore.opener(),  // <root>/index.sqlite
+        fileSystem: LocalFileSystem()               // Application Support
+    )
 )
 let manager = DownloadManager(configuration: configuration)
 try await manager.start()               // restore and reconcile before any command
@@ -60,7 +64,29 @@ if case .available(let lease) = try await manager.localFile(for: id) {
 }
 ```
 
-Until the production adapters land, `dependencies` must be supplied by the host (the test target shows complete fakes).
+Every dependency is a protocol, so a host can replace any adapter (the test target shows complete fakes).
+
+## Integration
+
+**What the host supplies.**
+
+- A storage namespace and a session identifier. Both are stable for the life of the app: the namespace names the root `Application Support/<namespace>/`, and the identifier names the transfer session.
+- The dependencies: `URLSessionTransport()`, `SQLiteIndexStore.opener()` and `LocalFileSystem()` are the production adapters; the clock and jitter default to the system ones. A path source is optional and has no production adapter yet.
+- Optionally a `URLRefreshing` implementation, for expired links (`refreshedURL`, persisted) and for per-attempt signed URLs that must stay out of the index (`transferURL`, never persisted).
+- One long-lived owner of the `DownloadManager` (for example the app delegate or an app-level model), which calls `start()` at launch.
+
+**What the adapters do.**
+
+- `URLSessionTransport` runs delegate-based download tasks on an ephemeral foreground session. Inside the delegate callback, before it returns, a finished response is checked (status, range continuation, `Content-Length`, media type, HTML bodies) and, when usable, moved into `staging/` with a durable receipt. Terminal events are written to `transfer/` under the root before they are delivered, keep their sequence numbers when replayed, and are deleted once the manager acknowledges them. Redirects are followed except from HTTPS to anything else. Tasks the package did not create are listed and never touched.
+- Resume data is opaque. It is used only when it is a property list and the session's network flags (`Options.sessionNetworkAccess`, default `NetworkPolicy.default`) are no more permissive than the item's policy, because a task created from resume data inherits the session's flags. Otherwise the attempt starts from zero. A continuation the server refuses (416) or answers with another representation starts again from zero; a 200 answer to a range request is a complete file, never appended.
+- Errors are classified: network loss, timeouts and 408/425/429/5xx are transient (Retry-After parsed from seconds or an HTTP date); a request refused for a cellular, expensive or constrained network is a policy wait; 401/403 are authentication failures; other 4xx are permanent; file errors are storage failures (disk full, permission, protection); certificate failures are permanent.
+- `SQLiteIndexStore` writes each change set in one transaction (WAL, full synchronous commits), refuses a newer schema or a foreign or unreadable file without touching it, and coalesces progress-only writes to one per second.
+- `LocalFileSystem` confines every path to the base directory, refuses symbolic links below it, separates a verified absence from a failed inspection, renames atomically within a volume and classifies errors.
+- The default finaliser validates the evidence recorded with the capture, the file length (against the capture and the host's expected length), the first bytes (no HTML) and the host's SHA-256 in bounded chunks, flushes, renames to `media/item-<generation>[.ext]` and only then lets the manager commit the completion. It defers at its deadline, on cancellation, or when a file is protected; nothing is marked completed before validation.
+
+**Foreground only.** This version creates no background `URLSession`. Transfers run while the app runs. When the process is suspended they stop with it (the system may fail them with a network error, which is retried as transient), and when it ends they end. On the next `start()`, reconciliation finds no task for the attempt and, after the session's backlog marker, starts it again (from zero, or from resume data a pause produced). `handleBackgroundEvents(forSession:completionHandler:)` exists, but nothing calls it in this version because the foreground session never wakes the app.
+
+**Not yet proven on iOS.** Everything above is tested on macOS against an in-process URLProtocol fixture. Not yet shown on an iOS device: background completion and relaunch (not implemented), the effect of file protection on created directories and the classification of protection errors, the interaction of request and session network flags on real cellular, expensive and constrained paths, and system resume data (the fixture cannot produce it, so range continuations are tested at the response-rule level).
 
 ## Concepts
 
@@ -108,9 +134,9 @@ Retry timers only run while the process runs. The due time is stored, and the ne
 
 ## Storage and persistence
 
-**Storage root.** `Application Support/<namespace>/`, where the namespace is chosen by the host; there is no default namespace and no fallback to Caches or temporary storage. If the root cannot be created, `start()` throws `storageUnavailable`. Inside the root the package owns `staging/` (captured, not yet validated files), `media/` (completed files) and the index. `media/` and `staging/` are excluded from backup; the index is kept. At start, and on lookup, a completed item whose file is verifiably absent becomes `missing` instead of pretending to be complete. A file that cannot be inspected (permission, file protection, I/O) is never treated as absent: lookup throws `fileAccessFailed` and the record is kept.
+**Storage root.** `Application Support/<namespace>/`, where the namespace is chosen by the host; there is no default namespace and no fallback to Caches or temporary storage. If the root cannot be created, `start()` throws `storageUnavailable`. Inside the root the package owns `staging/` (captured, not yet validated files), `media/` (completed files), the index (`index.sqlite` with the production store) and `transfer/` (the transfer adapter's inbox of unacknowledged events). `media/`, `staging/` and `transfer/` are excluded from backup; the index is kept. At start, and on lookup, a completed item whose file is verifiably absent becomes `missing` instead of pretending to be complete. A file that cannot be inspected (permission, file protection, I/O) is never treated as absent: lookup throws `fileAccessFailed` and the record is kept.
 
-**Relative paths only.** Every path in the index is relative to the root and re-validated when decoded, so a changed sandbox path or a tampered index cannot point outside the root. File names come from internal counters, never from ids, URLs or server-provided names.
+**Relative paths only.** Every path in the index is relative to the root and re-validated when decoded, so a changed sandbox path or a tampered index cannot point outside the root. File names come from internal counters, never from ids or server-provided names; a completed file may carry an extension chosen from a fixed allowlist (by declared media type, then by the source URL's extension) so players that infer the format from the name can open it.
 
 **Index record.** One `IndexRecord` per item: id, request identity (source URL, revision, expected length, checksum), metadata, optional policy, phase, attempt generation, automatic retry count and retry time, task binding (session identifier, task identifier, generation), byte counts, HTTP validators, integrity, finalisation journal, staging/final/resume-data paths and timestamps. Generations come from one counter per index and are never reused, so events from an old attempt can never match a removed or re-enqueued item. Records can be rebuilt by external stores through the public `IndexRecord` initialiser, which rejects contradictory fields.
 
@@ -118,13 +144,13 @@ Retry timers only run while the process runs. The due time is stored, and the ne
 
 **Schema versioning.** `IndexSchema.currentVersion` is 1. A newer stored version fails with `unsupportedSchema` and is left untouched; an unreadable index fails with `corruptIndex` and is preserved. The package never resets an index or deletes unrecognised files to recover.
 
-**Finalisation journal.** `notStarted` → `captured` (temporary file moved into `staging/` before the system callback returns, committed with its byte count, validators and planned destination) → `committed`, or `rejected` when validation fails. Between the two, validation, flush and an atomic rename to the deterministic destination `media/item-<generation>` run outside the command chain; they are idempotent, so an interruption anywhere in between is recovered by finalising the same generation again after the next start's replay. Only a committed record is `completed`. Until validation and atomic rename are implemented, captured files stay captured and are never handed out.
+**Finalisation journal.** `notStarted` → `captured` (temporary file moved into `staging/` before the system callback returns, committed with its byte count, validators and planned destination) → `committed`, or `rejected` when validation fails. Between the two, validation, flush and an atomic rename to the deterministic destination `media/item-<generation>[.ext]` run outside the command chain; they are idempotent, so an interruption anywhere in between is recovered by finalising the same generation again after the next start's replay (a file still in staging is validated and renamed; a file already renamed is validated again and committed). Only a committed record is `completed`, and only a committed record is handed out.
 
 **Cleanup intent.** A file the package decides to delete (a stale or rejected capture, a replaced completed file, superseded resume data) is written to the index's `cleanupPaths` in the same commit that releases it, deleted afterwards, and removed from the list only after the deletion was verified. A failed deletion is retried at later commands, `flushPendingWork()` and the next start. Files in `staging/` or `media/` that are neither owned nor listed are unknown: `unreferencedFiles()` reports them and nothing deletes them automatically.
 
 ## Concurrency
 
-The manager is a `Sendable` facade over one actor. All mutable state is actor-isolated; dependencies are `Sendable` protocols; snapshots and events are immutable values. The library uses no `@unchecked Sendable`, `nonisolated(unsafe)` or detached tasks. Swift 6 language mode with complete checking is what enforces isolation; a source test additionally trips on those spellings and on non-Foundation imports, as a lexical check only.
+The manager is a `Sendable` facade over one actor. All mutable state is actor-isolated; dependencies are `Sendable` protocols; snapshots and events are immutable values. The URLSession delegate holds only immutable values: inside each callback it does the synchronous work that cannot wait (judging a finished response, moving its file into `staging/`, writing a receipt) and forwards every callback, in order, through one `AsyncStream` continuation to the session's actor, so arrival order is callback order without a task per callback. The library uses no `@unchecked Sendable`, `nonisolated(unsafe)` or detached tasks. Swift 6 language mode with complete checking is what enforces isolation; a source test additionally trips on those spellings and on imports other than Foundation (outside the one file each for SQLite3 and CryptoKit), as a lexical check only.
 
 ## Testing
 
@@ -132,7 +158,17 @@ The manager is a `Sendable` facade over one actor. All mutable state is actor-is
 swift test
 ```
 
-The tests drive the manager with fakes: a scripted transfer session, an in-memory JSON index, an in-memory file system with fault injection, a manual clock and fixed jitter. No test sleeps. They cover the command and event transitions exercised in the state machine suites, stale-generation rejection, captured-byte ownership, idempotence, ordering, persistence-before-effects, rejected index writes, restart reconciliation (buffered completions, lost bindings, an initially allowed path, interrupted stops and renames, reused task numbers, a withheld backlog marker), suspended finalisers racing removal, cancel and detach, replay before recovered validation, persisted cleanup intent, schema refusal, the storage root rule, leases across detach, retries, policy changes, background-wake completion and snapshot subscriptions. A separate test target compiles external adapters against the public surface only. They do not cover a real URLSession, SQLite store or file system, which do not exist yet.
+The engine tests drive the manager with fakes: a scripted transfer session, an in-memory JSON index, an in-memory file system with fault injection, a manual clock and fixed jitter. None of them sleeps. They cover the command and event transitions exercised in the state machine suites, stale-generation rejection, captured-byte ownership, idempotence, ordering, persistence-before-effects, rejected index writes, restart reconciliation (buffered completions, lost bindings, an initially allowed path, interrupted stops and renames, reused task numbers, a withheld backlog marker), suspended finalisers racing removal, cancel and detach, replay before recovered validation, persisted cleanup intent, schema refusal, the storage root rule, leases across detach, retries, policy changes, background-wake completion and snapshot subscriptions. A separate test target compiles external adapters against the public surface only.
+
+The adapter tests use real files in a temporary directory:
+
+- the SQLite store: round trips of every record shape, schema refusal, foreign and unreadable files, an injected failure inside a transaction, progress coalescing, a copy taken with the connection open and a write torn inside a transaction;
+- the file system: absence against failed inspection, path escapes through `..` and symbolic links, chunked reads and hashing, atomic replacement and classified errors;
+- the finaliser: every validation failure (nothing renamed), the interrupted rename, deadlines, cancellation and injected full-disk, permission and protection failures;
+- the transfer adapter, against a URLProtocol fixture: 200, redirect, missing length, slow first byte, mid-transfer disconnect, truncated body, 404, 500 and 503 with Retry-After, HTML served as success, 401 and 403, an unsolicited 206, 416, unusable resume data, a refused continuation, durable replay with stable sequence numbers and foreign tasks; range continuations are tested at the response-rule level;
+- end to end through the manager on the production adapters: completion and offline lookup across a restart, checksum mismatch, error pages, retries, refreshed URLs, a denied write, cancel before the first byte, external deletion, a protected file, a lease across removal, and crash points (after capture, between rename and commit, a committed record whose file is gone, between commit and acknowledgement, an interrupted index write).
+
+The transfer and end-to-end tests wait on URLSession's own threads with bounded real-time polling. They do not cover a background session, a relaunch or an iOS device.
 
 ## License
 

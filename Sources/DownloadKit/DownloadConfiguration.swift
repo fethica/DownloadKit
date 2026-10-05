@@ -64,8 +64,9 @@ public struct DownloadConfiguration: Sendable {
 /// The injectable collaborators of a manager.
 ///
 /// Each one is a narrow protocol so tests can drive the manager with controlled events.
-/// The production transfer session, index store, file system and path source adapters are
-/// not implemented yet; ``SystemClock`` and ``SystemJitter`` are.
+/// Production adapters: ``URLSessionTransport`` (foreground only in this version),
+/// ``SQLiteIndexStore/opener(progressWriteInterval:clock:)``, ``LocalFileSystem``, ``SystemClock``
+/// and ``SystemJitter``. There is no production path source yet.
 public struct DownloadDependencies: Sendable {
     public var transport: any TransferSessionFactory
     /// Opens the index for a resolved storage root.
