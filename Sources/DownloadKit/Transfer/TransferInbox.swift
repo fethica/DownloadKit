@@ -15,7 +15,8 @@
 //    trusted), written inside the system callback before it returns, naming the task, its item
 //    and attempt, and later the replacement task. It lets a relaunched process recognise the
 //    refused task's late completion and the replacement, instead of reporting a failure. No URL
-//    is written: the replacement request is rebuilt from the system's own copy of the request.
+//    is written: the refusal is handed to the manager, which submits the replacement under the
+//    item's current source through its `transferURL` hook, so a fresh URL is resolved each time.
 //
 //  Order inside the callback: the receipt (naming the staging file the capture will use) is
 //  written before the temporary file is moved, so a moved file always has a durable association.
