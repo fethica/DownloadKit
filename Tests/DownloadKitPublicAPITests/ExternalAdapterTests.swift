@@ -24,10 +24,13 @@ actor RowStore: DownloadIndexStore {
                 automaticRetryCount: record.automaticRetryCount, retryAt: record.retryAt, binding: record.binding,
                 stoppingBinding: record.stoppingBinding, bytesWritten: record.bytesWritten, expectedBytes: record.expectedBytes,
                 validators: record.validators, integrity: record.integrity, journal: record.journal, stagingPath: record.stagingPath,
-                finalPath: record.finalPath, resumeDataPath: record.resumeDataPath, createdAt: record.createdAt, updatedAt: record.updatedAt
+                finalizationDestination: record.finalizationDestination, finalPath: record.finalPath, resumeDataPath: record.resumeDataPath, createdAt: record.createdAt, updatedAt: record.updatedAt
             )
         }
-        contents = IndexChangeSet(upserts: rebuilt, deletions: changes.deletions, nextGeneration: changes.nextGeneration, defaultPolicy: changes.defaultPolicy).applied(to: contents)
+        contents = IndexChangeSet(
+            upserts: rebuilt, deletions: changes.deletions, nextGeneration: changes.nextGeneration, defaultPolicy: changes.defaultPolicy,
+            cleanupQueued: changes.cleanupQueued, cleanupCompleted: changes.cleanupCompleted
+        ).applied(to: contents)
     }
 }
 

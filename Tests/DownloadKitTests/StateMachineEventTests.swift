@@ -161,7 +161,7 @@ final class StateMachineEventTests: XCTestCase {
         XCTAssertTrue(outcome.effects.isEmpty, "the bytes are neither deleted nor finalised")
         XCTAssertEqual(machine.phase("a"), .failed(DownloadFailure(kind: .cancelled)))
         XCTAssertEqual(machine.record("a")?.journal, .captured)
-        XCTAssertEqual(machine.record("a")?.ownedPaths, [path("staging/a")])
+        XCTAssertEqual(machine.record("a")?.ownedPaths, [path("staging/a"), .media(generation: generation)], "the planned destination is owned from the capture on")
 
         let retry = try machine.handle(.retry(itemID("a")), now: referenceDate)
 
@@ -212,8 +212,9 @@ final class StateMachineEventTests: XCTestCase {
         let outcome = machine.handle(.finalizationFailed(itemID("a"), generation: generation, .integrity), now: referenceDate, jitter: 0)
 
         XCTAssertEqual(machine.phase("a"), .failed(DownloadFailure(kind: .integrity)))
-        XCTAssertEqual(outcome.effects, [.discardFile(path("staging/a"))])
-        XCTAssertEqual(machine.record("a")?.journal, .notStarted)
+        XCTAssertEqual(outcome.effects, [.discardFile(path("staging/a")), .discardFile(.media(generation: generation))], "the capture and anything renamed to its destination")
+        XCTAssertEqual(outcome.cleanupQueued, [path("staging/a"), .media(generation: generation)])
+        XCTAssertEqual(machine.record("a")?.journal, .rejected, "the attempt's capture is consumed")
     }
 
     func testReplacementOfCorruptFileDiscardsOldFileOnlyAfterNewOneCommits() throws {

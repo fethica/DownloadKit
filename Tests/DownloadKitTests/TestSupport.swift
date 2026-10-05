@@ -40,8 +40,8 @@ func reference(_ raw: String, generation: UInt64, task: Int = 7) -> TransferTask
 }
 
 extension DownloadStateMachine {
-    static func fresh(policy: NetworkPolicy = .default, retry: RetryPolicy = .default) -> DownloadStateMachine {
-        DownloadStateMachine(contents: nil, sessionIdentifier: "session", defaultPolicy: policy, retryPolicy: retry)
+    static func fresh(policy: NetworkPolicy = .default, retry: RetryPolicy = .default, session: String = "session") -> DownloadStateMachine {
+        DownloadStateMachine(contents: nil, sessionIdentifier: session, defaultPolicy: policy, retryPolicy: retry)
     }
 
     func record(_ raw: String) -> IndexRecord? {

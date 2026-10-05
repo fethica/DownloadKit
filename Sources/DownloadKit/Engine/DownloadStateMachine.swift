@@ -38,6 +38,8 @@ struct DownloadStateMachine: Sendable, Equatable {
         /// or reconciliation found that task gone.
         case stopAcknowledged(DownloadID, taskIdentifier: Int)
         case pathChanged(NetworkPathStatus)
+        /// A queued file deletion was verified; its cleanup intent is closed.
+        case cleanupFinished(RelativePath)
     }
 
     enum Effect: Sendable, Equatable {
@@ -55,23 +57,51 @@ struct DownloadStateMachine: Sendable, Equatable {
         var changed: Set<DownloadID> = []
         var deleted: Set<DownloadID> = []
         var globalsChanged = false
+        /// Paths added to or removed from the persisted cleanup intent.
+        var cleanupQueued: Set<RelativePath> = []
+        var cleanupCompleted: Set<RelativePath> = []
         /// True when an event was rejected because its generation (or record) is gone.
         var ignoredStale = false
 
-        var hasStateChanges: Bool { !changed.isEmpty || !deleted.isEmpty || globalsChanged }
+        var hasStateChanges: Bool {
+            !changed.isEmpty || !deleted.isEmpty || globalsChanged || !cleanupQueued.isEmpty || !cleanupCompleted.isEmpty
+        }
     }
 
     private(set) var records: [DownloadID: IndexRecord]
     private(set) var nextGeneration: UInt64
     private(set) var defaultPolicy: NetworkPolicy
     private(set) var pathStatus: NetworkPathStatus?
+    /// Files queued for deletion and not yet verified deleted (persisted).
+    private(set) var cleanup: Set<RelativePath>
+    /// Attempts whose task may exist although no binding proves it: every restored attempt
+    /// that expects a transfer, until reconciliation adopts its task, applies its events or
+    /// proves it gone, and every submission until its binding is written. A nil binding on
+    /// such an attempt is not proof that the attempt ended, so path and policy changes only
+    /// change its explanation and never create a replacement.
+    private(set) var unconfirmed: [DownloadID: UInt64] = [:]
+    /// Policy changes held back for an unconfirmed attempt, applied once it is resolved.
+    private(set) var deferredResubmissions: Set<DownloadID> = []
     let sessionIdentifier: String
     let retryPolicy: RetryPolicy
 
     init(contents: IndexContents?, sessionIdentifier: String, defaultPolicy: NetworkPolicy, retryPolicy: RetryPolicy) {
         var records: [DownloadID: IndexRecord] = [:]
-        for record in contents?.records ?? [] { records[record.id] = record }
+        var unconfirmed: [DownloadID: UInt64] = [:]
+        for var record in contents?.records ?? [] {
+            if record.journal == .captured, record.finalizationDestination == nil, record.phase != .removing {
+                // Written before the destination was recorded: it is still implied by the
+                // capturing generation.
+                record.finalizationDestination = .media(generation: record.generation)
+            }
+            if record.phase.isAwaitingTransfer, record.journal != .captured {
+                unconfirmed[record.id] = record.generation
+            }
+            records[record.id] = record
+        }
         self.records = records
+        self.unconfirmed = unconfirmed
+        self.cleanup = Set(contents?.cleanupPaths ?? [])
         let highest = records.values.map(\.generation).max() ?? 0
         self.nextGeneration = max(contents?.nextGeneration ?? 1, highest + 1)
         self.defaultPolicy = contents?.defaultPolicy ?? defaultPolicy
@@ -234,8 +264,16 @@ struct DownloadStateMachine: Sendable, Equatable {
                 outcome.effects.append(.cancelTask(id, taskIdentifier: taskIdentifier, producingResumeData: false))
                 break
             }
-            record.binding = TaskBinding(sessionIdentifier: sessionIdentifier, taskIdentifier: taskIdentifier, generation: generation)
-            save(record, now: now, into: &outcome)
+            unconfirmed[id] = nil
+            let binding = TaskBinding(sessionIdentifier: sessionIdentifier, taskIdentifier: taskIdentifier, generation: generation)
+            if record.binding != binding {
+                record.binding = binding
+                save(record, now: now, into: &outcome)
+            }
+            if deferredResubmissions.remove(id) != nil {
+                // A policy change waited for this attempt to be known: apply it now.
+                resubmitForPolicyChange(id, now: now, into: &outcome)
+            }
 
         case .submissionFailed(let id, let generation, let failure):
             applyFailure(id, generation, failure, now: now, jitter: jitter, into: &outcome)
@@ -246,11 +284,18 @@ struct DownloadStateMachine: Sendable, Equatable {
 
         case .finalized(let id, let generation, let finalPath, let integrity):
             guard var record = current(id, generation, &outcome), record.journal == .captured else { break }
-            if let previous = record.finalPath, previous != finalPath { outcome.effects.append(.discardFile(previous)) }
-            if let resume = record.resumeDataPath { outcome.effects.append(.discardFile(resume)) }
+            // Linearisation point: the completion takes effect only if no stop was committed
+            // before this result. A paused or cancelled record keeps the validated file under
+            // its planned destination and its intent; resume or retry finalises it again
+            // (idempotently) and only then publishes the completion.
+            guard record.phase == .active else { break }
+            if let previous = record.finalPath, previous != finalPath { queueDiscard(previous, into: &outcome) }
+            if let resume = record.resumeDataPath { queueDiscard(resume, into: &outcome) }
+            if let destination = record.finalizationDestination, destination != finalPath { queueDiscard(destination, into: &outcome) }
             record.phase = .completed(at: now)
             record.journal = .committed
             record.stagingPath = nil
+            record.finalizationDestination = nil
             record.finalPath = finalPath
             record.resumeDataPath = nil
             record.bytesWritten = integrity.verifiedLength
@@ -262,10 +307,14 @@ struct DownloadStateMachine: Sendable, Equatable {
 
         case .finalizationFailed(let id, let generation, let failure):
             guard var record = current(id, generation, &outcome), record.journal == .captured else { break }
-            if let captured = record.stagingPath { outcome.effects.append(.discardFile(captured)) }
+            if let captured = record.stagingPath { queueDiscard(captured, into: &outcome) }
+            if let destination = record.finalizationDestination, destination != record.finalPath { queueDiscard(destination, into: &outcome) }
             record.stagingPath = nil
-            record.journal = .notStarted
-            record.phase = .failed(failure.downloadFailure)
+            record.finalizationDestination = nil
+            // The capture of this attempt is consumed: a replay of its completion is ignored.
+            record.journal = .rejected
+            // A stop committed before this result keeps its intent.
+            if record.phase == .active { record.phase = .failed(failure.downloadFailure) }
             save(record, now: now, into: &outcome)
 
         case .removalFinished(let id, let generation):
@@ -291,6 +340,8 @@ struct DownloadStateMachine: Sendable, Equatable {
 
         case .orphanedIntent(let id, let generation):
             guard let record = current(id, generation, &outcome), record.phase.isAwaitingTransfer, record.journal != .captured else { break }
+            unconfirmed[id] = nil
+            deferredResubmissions.remove(id)
             submit(id, now: now, into: &outcome)
 
         case .stopAcknowledged(let id, let taskIdentifier):
@@ -303,6 +354,10 @@ struct DownloadStateMachine: Sendable, Equatable {
             for id in records.keys.sorted() {
                 explain(id, status: status, now: now, into: &outcome)
             }
+
+        case .cleanupFinished(let path):
+            guard cleanup.remove(path) != nil else { break }
+            outcome.cleanupCompleted.insert(path)
         }
         return outcome
     }
@@ -341,6 +396,12 @@ struct DownloadStateMachine: Sendable, Equatable {
                 if record.stagingPath != captured { discardUnowned(captured, into: &outcome) }
                 break
             }
+            if record.journal == .rejected || record.journal == .committed {
+                // This attempt's capture was already received and consumed (validated or
+                // rejected): one capture per attempt, a replay never captures again.
+                discardUnowned(captured, into: &outcome)
+                break
+            }
             let finalizeNow: Bool
             switch record.phase {
             case .queued, .active, .waiting, .paused:
@@ -355,8 +416,11 @@ struct DownloadStateMachine: Sendable, Equatable {
                 return
             }
             if finalizeNow { record.phase = .active }
+            unconfirmed[record.id] = nil
+            deferredResubmissions.remove(record.id)
             record.journal = .captured
             record.stagingPath = captured
+            record.finalizationDestination = .media(generation: record.generation)
             record.bytesWritten = max(0, bytes)
             record.validators = validators
             record.binding = nil
@@ -376,7 +440,7 @@ struct DownloadStateMachine: Sendable, Equatable {
             }
             switch record.phase {
             case .paused, .failed:
-                if let previous = record.resumeDataPath, previous != path { outcome.effects.append(.discardFile(previous)) }
+                if let previous = record.resumeDataPath, previous != path { queueDiscard(previous, into: &outcome) }
                 record.resumeDataPath = path
                 save(record, now: now, into: &outcome)
             default:
@@ -389,6 +453,9 @@ struct DownloadStateMachine: Sendable, Equatable {
         // Failures for paused or cancelled items are the expected echo of our own cancel.
         guard var record = current(id, generation, &outcome), record.phase.isAwaitingTransfer, record.journal != .captured else { return }
         record.binding = nil
+        // The session reported the end of this attempt: it is no longer unconfirmed.
+        unconfirmed[id] = nil
+        let policyChangeWaited = deferredResubmissions.remove(id) != nil
         switch failure.classification {
         case .policyWait:
             record.phase = .waiting(.networkPolicy)
@@ -404,6 +471,10 @@ struct DownloadStateMachine: Sendable, Equatable {
             record.phase = .failed(failure.downloadFailure)
         }
         save(record, now: now, into: &outcome)
+        if policyChangeWaited, record.phase == .waiting(.networkPolicy) {
+            // The attempt ended on the old policy; the held-back change gets its one attempt.
+            submit(id, now: now, into: &outcome)
+        }
     }
 
     private mutating func explain(_ id: DownloadID, status: NetworkPathStatus, now: Date, into outcome: inout Outcome) {
@@ -421,10 +492,11 @@ struct DownloadStateMachine: Sendable, Equatable {
             save(record, now: now, into: &outcome)
         case .allowed:
             guard case .waiting = record.phase else { return }
-            if record.binding == nil {
-                // The earlier attempt ended on a policy refusal; start a new one, once.
+            if record.binding == nil, !isUnconfirmed(record) {
+                // The earlier attempt provably ended on a policy refusal; start a new one, once.
                 submit(id, now: now, into: &outcome)
             } else {
+                // A bound attempt, or one whose task may still exist: explanation only.
                 record.phase = .queued
                 save(record, now: now, into: &outcome)
             }
@@ -436,6 +508,11 @@ struct DownloadStateMachine: Sendable, Equatable {
     private func existing(_ id: DownloadID) throws -> IndexRecord {
         guard let record = records[id] else { throw DownloadError.unknownItem(id) }
         return record
+    }
+
+    /// Whether `record`'s current attempt may still have a task although no binding shows it.
+    func isUnconfirmed(_ record: IndexRecord) -> Bool {
+        unconfirmed[record.id] == record.generation
     }
 
     private func current(_ id: DownloadID, _ generation: UInt64, _ outcome: inout Outcome) -> IndexRecord? {
@@ -453,7 +530,7 @@ struct DownloadStateMachine: Sendable, Equatable {
         case .waiting(.retryScheduled):
             return true
         case .waiting:
-            return record.binding == nil && record.journal != .captured
+            return record.binding == nil && record.journal != .captured && !isUnconfirmed(record)
         default:
             return false
         }
@@ -489,6 +566,12 @@ struct DownloadStateMachine: Sendable, Equatable {
 
     private mutating func resubmitForPolicyChange(_ id: DownloadID, now: Date, into outcome: inout Outcome) {
         guard var record = records[id], record.phase.isAwaitingTransfer, record.journal != .captured else { return }
+        if record.binding == nil, isUnconfirmed(record) {
+            // The task, if any, cannot be cancelled yet and its completion may still arrive:
+            // hold the change until reconciliation knows the attempt.
+            deferredResubmissions.insert(id)
+            return
+        }
         stopTransfer(&record, producingResumeData: true, into: &outcome)
         save(record, now: now, into: &outcome)
         submit(id, now: now, into: &outcome)
@@ -510,6 +593,10 @@ struct DownloadStateMachine: Sendable, Equatable {
         record.binding = nil
         record.retryAt = nil
         record.phase = submissionPhase(for: record)
+        // A new attempt has received no capture yet.
+        record.journal = .notStarted
+        // Submitted, binding not yet written.
+        unconfirmed[id] = record.generation
         let submission = TransferSubmission(
             itemID: id,
             generation: record.generation,
@@ -531,8 +618,21 @@ struct DownloadStateMachine: Sendable, Equatable {
     }
 
     /// Discards `path` only when no record owns it.
-    private func discardUnowned(_ path: RelativePath, into outcome: inout Outcome) {
-        guard !records.values.contains(where: { $0.ownedPaths.contains(path) }) else { return }
+    private mutating func discardUnowned(_ path: RelativePath, into outcome: inout Outcome) {
+        guard !isOwned(path) else { return }
+        queueDiscard(path, into: &outcome)
+    }
+
+    /// Whether any record owns `path`.
+    func isOwned(_ path: RelativePath) -> Bool {
+        records.values.contains { $0.ownedPaths.contains(path) }
+    }
+
+    /// Persists the intent to delete `path` in the same commit as the change that released
+    /// it, then asks for the deletion. The intent is closed by ``Event/cleanupFinished(_:)``.
+    private mutating func queueDiscard(_ path: RelativePath, into outcome: inout Outcome) {
+        if cleanup.insert(path).inserted { outcome.cleanupQueued.insert(path) }
+        outcome.cleanupCompleted.remove(path)
         outcome.effects.append(.discardFile(path))
     }
 

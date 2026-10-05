@@ -36,7 +36,7 @@ final class StateMachineCaptureTests: XCTestCase {
         XCTAssertFalse(outcome.effects.contains { if case .discardFile = $0 { return true } else { return false } })
         XCTAssertEqual(machine.phase("a"), .failed(DownloadFailure(kind: .cancelled)))
         XCTAssertEqual(machine.record("a")?.journal, .captured)
-        XCTAssertEqual(machine.record("a")?.ownedPaths, [path("staging/a")])
+        XCTAssertEqual(machine.record("a")?.ownedPaths, [path("staging/a"), .media(generation: machine.generation("a"))])
     }
 
     func testStaleCompletionKeepsAFileAnotherRecordOwns() throws {

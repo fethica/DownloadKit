@@ -28,7 +28,8 @@ public enum IndexSchema {
 ///   ``stoppingBinding`` (a task the manager asked to stop and has not seen acknowledged);
 /// - bytes and validators: ``bytesWritten``, ``expectedBytes``, ``validators``,
 ///   ``resumeDataPath``;
-/// - finalisation: ``journal``, ``stagingPath``, ``finalPath``, ``integrity``.
+/// - finalisation: ``journal``, ``stagingPath``, ``finalizationDestination``, ``finalPath``,
+///   ``integrity``.
 ///
 /// Generations are allocated from one counter per index and never reused, so an event that
 /// carries an older generation can never match a removed, replaced or re-enqueued item.
@@ -37,7 +38,7 @@ public enum IndexSchema {
 /// are rejected. The source URL, including its query, is stored as given; see
 /// ``URLRefreshing`` for keeping signed query credentials out of the index.
 ///
-/// External stores rebuild records with ``init(id:request:metadata:policy:phase:generation:automaticRetryCount:retryAt:binding:stoppingBinding:bytesWritten:expectedBytes:validators:integrity:journal:stagingPath:finalPath:resumeDataPath:createdAt:updatedAt:)``
+/// External stores rebuild records with ``init(id:request:metadata:policy:phase:generation:automaticRetryCount:retryAt:binding:stoppingBinding:bytesWritten:expectedBytes:validators:integrity:journal:stagingPath:finalizationDestination:finalPath:resumeDataPath:createdAt:updatedAt:)``
 /// or store them as opaque `Codable` values.
 public struct IndexRecord: Hashable, Sendable, Codable {
     public internal(set) var id: DownloadID
@@ -59,6 +60,11 @@ public struct IndexRecord: Hashable, Sendable, Codable {
     public internal(set) var integrity: IntegrityRecord?
     public internal(set) var journal: FinalizationJournal
     public internal(set) var stagingPath: RelativePath?
+    /// Where the finaliser renames the captured file: `media/item-<generation>` of the
+    /// capturing attempt. Written in the same commit as the capture, before any rename, and
+    /// kept until the completion commits or the file is cleaned up, so a file the finaliser
+    /// may create is always owned by this record, including while it is being removed.
+    public internal(set) var finalizationDestination: RelativePath?
     public internal(set) var finalPath: RelativePath?
     /// Opaque, optional, version-sensitive resume data captured from a paused or cancelled
     /// transfer. Never the source of truth for the item.
@@ -88,6 +94,7 @@ public struct IndexRecord: Hashable, Sendable, Codable {
         integrity: IntegrityRecord?,
         journal: FinalizationJournal,
         stagingPath: RelativePath?,
+        finalizationDestination: RelativePath? = nil,
         finalPath: RelativePath?,
         resumeDataPath: RelativePath?,
         createdAt: Date,
@@ -101,8 +108,8 @@ public struct IndexRecord: Hashable, Sendable, Codable {
             generation: generation, automaticRetryCount: max(0, automaticRetryCount), retryAt: retryAt,
             binding: binding, stoppingBinding: stoppingBinding, bytesWritten: max(0, bytesWritten),
             expectedBytes: expectedBytes, validators: validators, integrity: integrity, journal: journal,
-            stagingPath: stagingPath, finalPath: finalPath, resumeDataPath: resumeDataPath,
-            createdAt: createdAt, updatedAt: updatedAt
+            stagingPath: stagingPath, finalizationDestination: finalizationDestination, finalPath: finalPath,
+            resumeDataPath: resumeDataPath, createdAt: createdAt, updatedAt: updatedAt
         )
     }
 
@@ -123,6 +130,7 @@ public struct IndexRecord: Hashable, Sendable, Codable {
         integrity: IntegrityRecord?,
         journal: FinalizationJournal,
         stagingPath: RelativePath?,
+        finalizationDestination: RelativePath? = nil,
         finalPath: RelativePath?,
         resumeDataPath: RelativePath?,
         createdAt: Date,
@@ -144,6 +152,7 @@ public struct IndexRecord: Hashable, Sendable, Codable {
         self.integrity = integrity
         self.journal = journal
         self.stagingPath = stagingPath
+        self.finalizationDestination = finalizationDestination
         self.finalPath = finalPath
         self.resumeDataPath = resumeDataPath
         self.createdAt = createdAt
@@ -155,7 +164,9 @@ public struct IndexRecord: Hashable, Sendable, Codable {
 
     /// Files under the root owned by this record.
     public var ownedPaths: [RelativePath] {
-        [finalPath, stagingPath, resumeDataPath].compactMap { $0 }
+        var paths = [finalPath, stagingPath, resumeDataPath].compactMap { $0 }
+        if let finalizationDestination, !paths.contains(finalizationDestination) { paths.append(finalizationDestination) }
+        return paths
     }
 }
 
@@ -263,18 +274,27 @@ public struct IntegrityRecord: Hashable, Sendable, Codable {
 ///
 /// Finalisation order:
 /// 1. ``captured``: the downloaded temporary file was moved into `staging/` before the system
-///    callback returned, and the capture (path, byte count, validators) is committed with the
-///    record. Until that commit the transfer session keeps the unacknowledged event and
-///    delivers it again after a relaunch, so the capture never loses its association.
+///    callback returned, and the capture (path, byte count, validators, and the planned
+///    ``IndexRecord/finalizationDestination``) is committed with the record. Until that
+///    commit the transfer session keeps the unacknowledged event and delivers it again after
+///    a relaunch, so the capture never loses its association.
 /// 2. The finaliser validates length and checksum, flushes the file and renames it to the
 ///    deterministic destination ``RelativePath`` `media/item-<generation>`. These steps are
 ///    not journaled separately: they are idempotent, and a finaliser that finds the staging
 ///    file gone and a valid file at the destination reports it as finalised.
 /// 3. ``committed``: the completed record was committed; only now is the item completed.
+///    ``rejected``: validation failed; the capture of this attempt was consumed and its files
+///    are queued for deletion.
 ///
-/// Start-up recovery rule: an active record whose journal is `captured` is finalised again
-/// for the same generation, which covers an interruption before validation, between rename
-/// and commit, and a deferred finalisation. A committed record whose file is verifiably absent
+/// One capture per attempt: once an attempt's capture was received (``captured``,
+/// ``committed`` or ``rejected``), a replay of a completion for the same attempt never
+/// captures again, whatever happened to the record since. Only a new attempt (a new
+/// generation) resets the journal to ``notStarted``.
+///
+/// Start-up recovery rule: an active, paused or cancelled record whose journal is `captured`
+/// keeps its bytes. Active ones are finalised again for the same generation once the session
+/// delivered its backlog, which covers an interruption before validation, between rename and
+/// commit, and a deferred finalisation. A committed record whose file is verifiably absent
 /// becomes ``RecordPhase/missing``. A completed file that replaces an older one never
 /// overwrites it, because each generation has its own destination; the older file is
 /// deleted only after the newer record commits.
@@ -282,4 +302,5 @@ public enum FinalizationJournal: String, Hashable, Sendable, Codable {
     case notStarted
     case captured
     case committed
+    case rejected
 }
