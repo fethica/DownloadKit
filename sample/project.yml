@@ -1,0 +1,35 @@
+name: DownloadKitSample
+options:
+  deploymentTarget:
+    iOS: 15.0
+packages:
+  DownloadKit:
+    path: ..
+  FRadioPlayer:
+    url: https://github.com/fethica/FRadioPlayer
+    from: 0.4.0
+targets:
+  DownloadKitSample:
+    type: application
+    platform: iOS
+    sources:
+      - path: DownloadKitSample
+    dependencies:
+      - package: DownloadKit
+        product: DownloadKit
+      - package: DownloadKit
+        product: DownloadKitUI
+      # Optional: completed-only local playback. Remove these two lines to build without it;
+      # the player screen is compiled only when FRadioPlayer can be imported.
+      - package: FRadioPlayer
+        product: FRadioPlayer
+    settings:
+      base:
+        INFOPLIST_FILE: DownloadKitSample/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.fethica.downloadkit.sample
+        SWIFT_VERSION: "6.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CURRENT_PROJECT_VERSION: 1
+        MARKETING_VERSION: "1.0"
+    scheme:
+      testTargets: []
