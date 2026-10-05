@@ -1,0 +1,511 @@
+//
+//  DownloadStateMachine.swift
+//  DownloadKit
+//
+//  The pure transition rules. No I/O, no clocks, no randomness: every input (time, jitter,
+//  path status) is passed in, and every side effect is returned as data.
+//
+
+import Foundation
+
+struct DownloadStateMachine: Sendable, Equatable {
+
+    enum Command: Sendable, Equatable {
+        case enqueue(DownloadRequest)
+        case pause(DownloadID)
+        case resume(DownloadID)
+        case cancel(DownloadID)
+        case retry(DownloadID)
+        case remove(DownloadID)
+        case setDefaultPolicy(NetworkPolicy)
+        case setPolicy(NetworkPolicy?, DownloadID)
+        case updateSource(URL, DownloadID)
+    }
+
+    enum Event: Sendable, Equatable {
+        case transfer(TransferEvent)
+        case taskBound(DownloadID, generation: UInt64, taskIdentifier: Int)
+        case submissionFailed(DownloadID, generation: UInt64, TransferFailure)
+        case retryDue(DownloadID, generation: UInt64)
+        case finalized(DownloadID, generation: UInt64, finalPath: RelativePath, integrity: IntegrityRecord)
+        case finalizationFailed(DownloadID, generation: UInt64, TransferFailure)
+        case removalFinished(DownloadID, generation: UInt64)
+        case fileMissing(DownloadID, generation: UInt64)
+        case fileCorrupt(DownloadID, generation: UInt64)
+        case orphanedIntent(DownloadID)
+        case pathChanged(NetworkPathStatus)
+    }
+
+    enum Effect: Sendable, Equatable {
+        case submit(TransferSubmission)
+        case cancelTask(DownloadID, taskIdentifier: Int, producingResumeData: Bool)
+        case finalize(DownloadID, generation: UInt64, captured: RelativePath)
+        case discardFile(RelativePath)
+        case deleteOwnedFiles(DownloadID, generation: UInt64, paths: [RelativePath])
+        case scheduleRetry(DownloadID, generation: UInt64, at: Date)
+        case unscheduleRetry(DownloadID)
+    }
+
+    struct Outcome: Sendable, Equatable {
+        var effects: [Effect] = []
+        var changed: Set<DownloadID> = []
+        var deleted: Set<DownloadID> = []
+        var globalsChanged = false
+        /// True when an event was rejected because its generation (or record) is gone.
+        var ignoredStale = false
+
+        var hasStateChanges: Bool { !changed.isEmpty || !deleted.isEmpty || globalsChanged }
+    }
+
+    private(set) var records: [DownloadID: IndexRecord]
+    private(set) var nextGeneration: UInt64
+    private(set) var defaultPolicy: NetworkPolicy
+    private(set) var pathStatus: NetworkPathStatus?
+    let sessionIdentifier: String
+    let retryPolicy: RetryPolicy
+
+    init(contents: IndexContents?, sessionIdentifier: String, defaultPolicy: NetworkPolicy, retryPolicy: RetryPolicy) {
+        var records: [DownloadID: IndexRecord] = [:]
+        for record in contents?.records ?? [] { records[record.id] = record }
+        self.records = records
+        let highest = records.values.map(\.generation).max() ?? 0
+        self.nextGeneration = max(contents?.nextGeneration ?? 1, highest + 1)
+        self.defaultPolicy = contents?.defaultPolicy ?? defaultPolicy
+        self.pathStatus = nil
+        self.sessionIdentifier = sessionIdentifier
+        self.retryPolicy = retryPolicy
+    }
+
+    // MARK: Queries
+
+    func effectivePolicy(for record: IndexRecord) -> NetworkPolicy {
+        record.policy ?? defaultPolicy
+    }
+
+    func snapshot(for id: DownloadID) -> DownloadSnapshot? {
+        records[id]?.snapshot
+    }
+
+    func snapshots() -> [DownloadSnapshot] {
+        records.values
+            .sorted { ($0.createdAt, $0.id) < ($1.createdAt, $1.id) }
+            .map(\.snapshot)
+    }
+
+    // MARK: Commands
+
+    mutating func handle(_ command: Command, now: Date) throws -> Outcome {
+        var outcome = Outcome()
+        switch command {
+        case .enqueue(let request):
+            try enqueue(request, now: now, into: &outcome)
+
+        case .pause(let id):
+            var record = try existing(id)
+            guard record.phase.isTransferring else { break }
+            stopTransfer(&record, producingResumeData: true, into: &outcome)
+            record.phase = .paused
+            save(record, now: now, into: &outcome)
+
+        case .resume(let id):
+            let record = try existing(id)
+            guard record.phase == .paused else { break }
+            submit(id, now: now, into: &outcome)
+
+        case .cancel(let id):
+            var record = try existing(id)
+            guard record.phase.isTransferring || record.phase == .paused else { break }
+            stopTransfer(&record, producingResumeData: true, into: &outcome)
+            record.phase = .failed(DownloadFailure(kind: .cancelled))
+            save(record, now: now, into: &outcome)
+
+        case .retry(let id):
+            var record = try existing(id)
+            guard acceptsRetry(record) else { break }
+            stopTransfer(&record, producingResumeData: true, into: &outcome)
+            record.automaticRetryCount = 0
+            save(record, now: now, into: &outcome)
+            submit(id, now: now, into: &outcome)
+
+        case .remove(let id):
+            guard var record = records[id], record.phase != .removing else { break }
+            stopTransfer(&record, producingResumeData: false, into: &outcome)
+            record.generation = allocateGeneration()
+            record.phase = .removing
+            save(record, now: now, into: &outcome)
+            outcome.effects.append(.deleteOwnedFiles(id, generation: record.generation, paths: record.ownedPaths))
+
+        case .setDefaultPolicy(let policy):
+            guard policy != defaultPolicy else { break }
+            defaultPolicy = policy
+            outcome.globalsChanged = true
+            for id in records.keys.sorted() where records[id]?.policy == nil {
+                resubmitForPolicyChange(id, now: now, into: &outcome)
+            }
+
+        case .setPolicy(let policy, let id):
+            var record = try existing(id)
+            guard record.phase != .removing else { throw DownloadError.itemBeingRemoved(id) }
+            guard record.policy != policy else { break }
+            let previous = effectivePolicy(for: record)
+            record.policy = policy
+            save(record, now: now, into: &outcome)
+            if effectivePolicy(for: record) != previous {
+                resubmitForPolicyChange(id, now: now, into: &outcome)
+            }
+
+        case .updateSource(let url, let id):
+            var record = try existing(id)
+            guard record.request.sourceURL != url else { break }
+            record.request.sourceURL = url
+            save(record, now: now, into: &outcome)
+        }
+        return outcome
+    }
+
+    private mutating func enqueue(_ request: DownloadRequest, now: Date, into outcome: inout Outcome) throws {
+        guard let scheme = request.url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+            throw DownloadError.unsupportedURL(request.id)
+        }
+        let identity = RequestIdentity(request)
+        guard var record = records[request.id] else {
+            records[request.id] = IndexRecord(
+                id: request.id,
+                request: identity,
+                metadata: request.metadata,
+                policy: request.policy,
+                phase: .queued,
+                generation: 0,
+                automaticRetryCount: 0,
+                retryAt: nil,
+                binding: nil,
+                bytesWritten: 0,
+                expectedBytes: request.expectedLength,
+                validators: nil,
+                integrity: nil,
+                journal: .notStarted,
+                stagingPath: nil,
+                finalPath: nil,
+                resumeDataPath: nil,
+                createdAt: now,
+                updatedAt: now
+            )
+            submit(request.id, now: now, into: &outcome)
+            return
+        }
+        guard record.phase != .removing else { throw DownloadError.itemBeingRemoved(request.id) }
+        guard record.request.hasSameContent(as: identity) else { throw DownloadError.conflictingRequest(request.id) }
+
+        var touched = false
+        if record.request.sourceURL != request.url {
+            record.request.sourceURL = request.url
+            touched = true
+        }
+        if record.metadata != request.metadata {
+            record.metadata = request.metadata
+            touched = true
+        }
+        if touched { save(record, now: now, into: &outcome) }
+        if record.phase == .missing { submit(request.id, now: now, into: &outcome) }
+    }
+
+    // MARK: Events
+
+    mutating func handle(_ event: Event, now: Date, jitter: Double) -> Outcome {
+        var outcome = Outcome()
+        switch event {
+        case .transfer(let transfer):
+            handleTransfer(transfer, now: now, jitter: jitter, into: &outcome)
+
+        case .taskBound(let id, let generation, let taskIdentifier):
+            guard var record = current(id, generation, &outcome), record.phase.isAwaitingTransfer else {
+                // A task nobody wants any more must not keep running.
+                outcome.effects.append(.cancelTask(id, taskIdentifier: taskIdentifier, producingResumeData: false))
+                break
+            }
+            record.binding = TaskBinding(sessionIdentifier: sessionIdentifier, taskIdentifier: taskIdentifier, generation: generation)
+            save(record, now: now, into: &outcome)
+
+        case .submissionFailed(let id, let generation, let failure):
+            applyFailure(id, generation, failure, now: now, jitter: jitter, into: &outcome)
+
+        case .retryDue(let id, let generation):
+            guard let record = current(id, generation, &outcome), case .waiting(.retryScheduled) = record.phase else { break }
+            submit(id, now: now, into: &outcome)
+
+        case .finalized(let id, let generation, let finalPath, let integrity):
+            guard var record = current(id, generation, &outcome), record.journal == .captured else { break }
+            if let previous = record.finalPath, previous != finalPath { outcome.effects.append(.discardFile(previous)) }
+            if let resume = record.resumeDataPath { outcome.effects.append(.discardFile(resume)) }
+            record.phase = .completed(at: now)
+            record.journal = .committed
+            record.stagingPath = nil
+            record.finalPath = finalPath
+            record.resumeDataPath = nil
+            record.bytesWritten = integrity.verifiedLength
+            record.expectedBytes = integrity.verifiedLength
+            record.integrity = integrity
+            record.binding = nil
+            record.retryAt = nil
+            save(record, now: now, into: &outcome)
+
+        case .finalizationFailed(let id, let generation, let failure):
+            guard var record = current(id, generation, &outcome), record.journal == .captured else { break }
+            if let captured = record.stagingPath { outcome.effects.append(.discardFile(captured)) }
+            record.stagingPath = nil
+            record.journal = .notStarted
+            record.phase = .failed(failure.downloadFailure)
+            save(record, now: now, into: &outcome)
+
+        case .removalFinished(let id, let generation):
+            guard let record = current(id, generation, &outcome), record.phase == .removing else { break }
+            records[id] = nil
+            outcome.changed.remove(id)
+            outcome.deleted.insert(id)
+
+        case .fileMissing(let id, let generation):
+            guard var record = current(id, generation, &outcome), case .completed = record.phase else { break }
+            record.phase = .missing
+            record.finalPath = nil
+            record.integrity = nil
+            record.journal = .notStarted
+            record.bytesWritten = 0
+            save(record, now: now, into: &outcome)
+
+        case .fileCorrupt(let id, let generation):
+            guard var record = current(id, generation, &outcome), case .completed = record.phase else { break }
+            // The file stays recorded so a later successful attempt can replace it safely.
+            record.phase = .failed(DownloadFailure(kind: .integrity))
+            save(record, now: now, into: &outcome)
+
+        case .orphanedIntent(let id):
+            guard let record = records[id], record.phase.isAwaitingTransfer, record.journal != .captured else { break }
+            submit(id, now: now, into: &outcome)
+
+        case .pathChanged(let status):
+            pathStatus = status
+            for id in records.keys.sorted() {
+                explain(id, status: status, now: now, into: &outcome)
+            }
+        }
+        return outcome
+    }
+
+    private mutating func handleTransfer(_ event: TransferEvent, now: Date, jitter: Double, into outcome: inout Outcome) {
+        switch event {
+        case .progress(let reference, let bytes, let expected):
+            guard var record = current(reference.itemID, reference.generation, &outcome),
+                  record.phase.isAwaitingTransfer, record.journal != .captured else { break }
+            record.phase = .active
+            record.bytesWritten = max(0, bytes)
+            if let expected, expected > 0 { record.expectedBytes = expected }
+            if record.binding == nil {
+                record.binding = TaskBinding(sessionIdentifier: sessionIdentifier, taskIdentifier: reference.taskIdentifier, generation: reference.generation)
+            }
+            save(record, now: now, into: &outcome)
+
+        case .waiting(let reference, let reason):
+            guard var record = current(reference.itemID, reference.generation, &outcome),
+                  record.phase.isAwaitingTransfer, record.journal != .captured else { break }
+            // Only the manager schedules retries; a session cannot claim one.
+            let honest: WaitReason = reason.isRetrySchedule ? .unknown : reason
+            guard record.phase != .waiting(honest) else { break }
+            record.phase = .waiting(honest)
+            save(record, now: now, into: &outcome)
+
+        case .finished(let reference, let captured, let bytes, let validators):
+            guard var record = current(reference.itemID, reference.generation, &outcome),
+                  record.phase.isAwaitingTransfer || record.phase == .paused,
+                  record.journal != .captured else {
+                // Stale, cancelled or duplicate completion: the captured bytes belong to nobody.
+                outcome.effects.append(.discardFile(captured))
+                break
+            }
+            record.phase = .active
+            record.journal = .captured
+            record.stagingPath = captured
+            record.bytesWritten = max(0, bytes)
+            record.validators = validators
+            record.binding = nil
+            save(record, now: now, into: &outcome)
+            outcome.effects.append(.finalize(record.id, generation: record.generation, captured: captured))
+
+        case .failed(let reference, let failure):
+            applyFailure(reference.itemID, reference.generation, failure, now: now, jitter: jitter, into: &outcome)
+
+        case .resumeDataCaptured(let reference, let path):
+            guard var record = current(reference.itemID, reference.generation, &outcome) else {
+                outcome.effects.append(.discardFile(path))
+                break
+            }
+            switch record.phase {
+            case .paused, .failed:
+                if let previous = record.resumeDataPath, previous != path { outcome.effects.append(.discardFile(previous)) }
+                record.resumeDataPath = path
+                save(record, now: now, into: &outcome)
+            default:
+                outcome.effects.append(.discardFile(path))
+            }
+        }
+    }
+
+    private mutating func applyFailure(_ id: DownloadID, _ generation: UInt64, _ failure: TransferFailure, now: Date, jitter: Double, into outcome: inout Outcome) {
+        // Failures for paused or cancelled items are the expected echo of our own cancel.
+        guard var record = current(id, generation, &outcome), record.phase.isAwaitingTransfer, record.journal != .captured else { return }
+        record.binding = nil
+        switch failure.classification {
+        case .policyWait:
+            record.phase = .waiting(.networkPolicy)
+        case .networkTransient where record.automaticRetryCount < retryPolicy.maximumAutomaticRetries:
+            let delay = retryPolicy.delay(forRetry: record.automaticRetryCount, jitter: jitter, retryAfter: failure.retryAfter)
+            let dueAt = now.addingTimeInterval(delay)
+            record.automaticRetryCount += 1
+            record.retryAt = dueAt
+            record.phase = .waiting(.retryScheduled(at: dueAt))
+            outcome.effects.append(.scheduleRetry(id, generation: record.generation, at: dueAt))
+        default:
+            record.retryAt = nil
+            record.phase = .failed(failure.downloadFailure)
+        }
+        save(record, now: now, into: &outcome)
+    }
+
+    private mutating func explain(_ id: DownloadID, status: NetworkPathStatus, now: Date, into outcome: inout Outcome) {
+        guard var record = records[id], record.journal != .captured else { return }
+        switch record.phase {
+        case .queued, .active, .waiting(.networkPolicy), .waiting(.connectivity):
+            break
+        default:
+            return
+        }
+        switch effectivePolicy(for: record).evaluate(status) {
+        case .waiting(let reason):
+            guard record.phase != .waiting(reason) else { return }
+            record.phase = .waiting(reason)
+            save(record, now: now, into: &outcome)
+        case .allowed:
+            guard case .waiting = record.phase else { return }
+            if record.binding == nil {
+                // The earlier attempt ended on a policy refusal; start a new one, once.
+                submit(id, now: now, into: &outcome)
+            } else {
+                record.phase = .queued
+                save(record, now: now, into: &outcome)
+            }
+        }
+    }
+
+    // MARK: Helpers
+
+    private func existing(_ id: DownloadID) throws -> IndexRecord {
+        guard let record = records[id] else { throw DownloadError.unknownItem(id) }
+        return record
+    }
+
+    private func current(_ id: DownloadID, _ generation: UInt64, _ outcome: inout Outcome) -> IndexRecord? {
+        guard let record = records[id], record.generation == generation else {
+            outcome.ignoredStale = true
+            return nil
+        }
+        return record
+    }
+
+    private func acceptsRetry(_ record: IndexRecord) -> Bool {
+        switch record.phase {
+        case .failed, .missing:
+            return true
+        case .waiting(.retryScheduled):
+            return true
+        case .waiting:
+            return record.binding == nil && record.journal != .captured
+        default:
+            return false
+        }
+    }
+
+    private mutating func allocateGeneration() -> UInt64 {
+        let generation = nextGeneration
+        nextGeneration += 1
+        return generation
+    }
+
+    private func submissionPhase(for record: IndexRecord) -> RecordPhase {
+        if let pathStatus, case .waiting(let reason) = effectivePolicy(for: record).evaluate(pathStatus) {
+            return .waiting(reason)
+        }
+        return .queued
+    }
+
+    private func stopTransfer(_ record: inout IndexRecord, producingResumeData: Bool, into outcome: inout Outcome) {
+        if case .waiting(.retryScheduled) = record.phase {
+            outcome.effects.append(.unscheduleRetry(record.id))
+        }
+        if let binding = record.binding {
+            outcome.effects.append(.cancelTask(record.id, taskIdentifier: binding.taskIdentifier, producingResumeData: producingResumeData))
+        }
+        record.binding = nil
+        record.retryAt = nil
+    }
+
+    private mutating func resubmitForPolicyChange(_ id: DownloadID, now: Date, into outcome: inout Outcome) {
+        guard var record = records[id], record.phase.isAwaitingTransfer, record.journal != .captured else { return }
+        stopTransfer(&record, producingResumeData: true, into: &outcome)
+        save(record, now: now, into: &outcome)
+        submit(id, now: now, into: &outcome)
+    }
+
+    private mutating func submit(_ id: DownloadID, now: Date, into outcome: inout Outcome) {
+        guard var record = records[id] else { return }
+        record.generation = allocateGeneration()
+        record.binding = nil
+        record.retryAt = nil
+        record.phase = submissionPhase(for: record)
+        let submission = TransferSubmission(
+            itemID: id,
+            generation: record.generation,
+            url: record.request.sourceURL,
+            policy: effectivePolicy(for: record),
+            resumeDataPath: record.resumeDataPath,
+            expectedLength: record.request.expectedLength
+        )
+        // Resume data is handed to the session, which owns it from now on.
+        record.resumeDataPath = nil
+        save(record, now: now, into: &outcome)
+        outcome.effects.append(.submit(submission))
+    }
+
+    private mutating func save(_ record: IndexRecord, now: Date, into outcome: inout Outcome) {
+        var record = record
+        record.updatedAt = now
+        records[record.id] = record
+        outcome.changed.insert(record.id)
+    }
+}
+
+extension IndexRecord {
+    /// The public view of this record.
+    var snapshot: DownloadSnapshot {
+        let state: DownloadState
+        switch phase {
+        case .queued: state = .queued
+        case .active: state = .active
+        case .paused: state = .paused(resumable: resumeDataPath != nil)
+        case .waiting(let reason): state = .waiting(reason)
+        case .completed(let date): state = .completed(at: date)
+        case .failed(let failure): state = .failed(failure)
+        case .removing: state = .removing
+        case .missing: state = .missing
+        }
+        return DownloadSnapshot(
+            id: id,
+            revision: request.revision,
+            metadata: metadata,
+            state: state,
+            bytesWritten: bytesWritten,
+            expectedBytes: expectedBytes,
+            automaticRetryCount: automaticRetryCount,
+            retryAt: retryAt,
+            updatedAt: updatedAt
+        )
+    }
+}
