@@ -47,12 +47,22 @@ final class HTTPServer: Sendable {
         }
     }
 
-    private func handle(_ fd: Int32) {
-        guard let request = readRequest(fd) else {
+    /// Answers one connection and closes it. A request that cannot be framed gets a 400 and
+    /// ends only its own connection; the server keeps accepting others.
+    func handle(_ fd: Int32) {
+        let request: HTTPRequest
+        let plan: ResponsePlan
+        switch readRequest(fd) {
+        case .closed:
             close(fd)
             return
+        case .malformed(let reason):
+            request = HTTPRequest(method: "-", target: "-", headers: [:])
+            plan = ResponsePlan.text(400, "bad request: \(reason)")
+        case .request(let parsed):
+            request = parsed
+            plan = responder.plan(for: parsed)
         }
-        let plan = responder.plan(for: request)
         if plan.delay > 0 { Thread.sleep(forTimeInterval: plan.delay) }
 
         var head = "HTTP/1.1 \(plan.status) \(Self.reason(plan.status))\r\n"
@@ -89,34 +99,30 @@ final class HTTPServer: Sendable {
     }
 
     /// Reads the request head and a small form body (control requests only).
-    private func readRequest(_ fd: Int32) -> HTTPRequest? {
+    private func readRequest(_ fd: Int32) -> RequestRead {
         var buffer = Data()
         var chunk = [UInt8](repeating: 0, count: 4_096)
         let separator = Data("\r\n\r\n".utf8)
         while buffer.range(of: separator) == nil {
+            if buffer.count > RequestHead.maxHeadLength { return .malformed("request head too large") }
             let count = recv(fd, &chunk, chunk.count, 0)
-            guard count > 0 else { return nil }
+            guard count > 0 else { return buffer.isEmpty ? .closed : .malformed("incomplete request head") }
             buffer.append(contentsOf: chunk[0..<count])
-            if buffer.count > 32_768 { return nil }
         }
-        guard let end = buffer.range(of: separator),
-              let head = String(data: buffer[buffer.startIndex..<end.lowerBound], encoding: .utf8) else { return nil }
-        var lines = head.components(separatedBy: "\r\n")
-        let requestLine = lines.removeFirst().split(separator: " ")
-        guard requestLine.count >= 2 else { return nil }
-        var headers: [String: String] = [:]
-        for line in lines {
-            guard let colon = line.firstIndex(of: ":") else { continue }
-            headers[String(line[..<colon]).lowercased()] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+        guard let end = buffer.range(of: separator) else { return .malformed("incomplete request head") }
+        guard end.lowerBound - buffer.startIndex <= RequestHead.maxHeadLength else { return .malformed("request head too large") }
+        let head: RequestHead
+        switch RequestHead.parse(buffer[buffer.startIndex..<end.lowerBound]) {
+        case .success(let parsed): head = parsed
+        case .failure(let failure): return .malformed(failure.reason)
         }
         var body = Data(buffer[end.upperBound...])
-        let length = min(4_096, headers["content-length"].flatMap(Int.init) ?? 0)
-        while body.count < length {
+        while body.count < head.contentLength {
             let count = recv(fd, &chunk, chunk.count, 0)
-            guard count > 0 else { break }
+            guard count > 0 else { return .malformed("body shorter than Content-Length") }
             body.append(contentsOf: chunk[0..<count])
         }
-        return HTTPRequest(method: String(requestLine[0]), target: String(requestLine[1]), headers: headers, body: body.prefix(length))
+        return .request(HTTPRequest(method: head.method, target: head.target, headers: head.headers, body: body.prefix(head.contentLength)))
     }
 
     private func write(_ fd: Int32, _ data: Data) -> Bool {
@@ -148,6 +154,79 @@ final class HTTPServer: Sendable {
         case 503: return "Service Unavailable"
         default: return "Status"
         }
+    }
+}
+
+/// What reading a connection produced.
+enum RequestRead {
+    /// The peer closed before sending anything.
+    case closed
+    /// The bytes cannot be framed as one request; answered with 400.
+    case malformed(String)
+    case request(HTTPRequest)
+}
+
+/// A parsed request line and header block, validated before any body is read.
+struct RequestHead: Equatable {
+    /// The largest accepted head, request line and headers together.
+    static let maxHeadLength = 32_768
+    /// The largest accepted body. Only control requests carry one, a short form.
+    static let maxBodyLength = 4_096
+
+    struct Failure: Error, Equatable {
+        let reason: String
+    }
+
+    var method: String
+    var target: String
+    /// Lowercased names.
+    var headers: [String: String]
+    var contentLength: Int
+
+    /// Parses the bytes before the blank line. Rejects a request line that is not
+    /// `METHOD /target HTTP/x.y`, a header line without a name, and a `Content-Length` that is
+    /// not a decimal number within ``maxBodyLength`` (or that disagrees with a repeated one), and
+    /// any `Transfer-Encoding`.
+    static func parse(_ bytes: Data) -> Result<RequestHead, Failure> {
+        guard let text = String(data: bytes, encoding: .utf8) else { return .failure(Failure(reason: "head is not UTF-8")) }
+        var lines = text.components(separatedBy: "\r\n")
+        let requestLine = lines.removeFirst().split(separator: " ", omittingEmptySubsequences: false)
+        guard requestLine.count == 3,
+              !requestLine[0].isEmpty, requestLine[0].allSatisfy({ $0.isASCII && $0.isLetter }),
+              requestLine[1].hasPrefix("/"),
+              requestLine[2].hasPrefix("HTTP/1.") else {
+            return .failure(Failure(reason: "malformed request line"))
+        }
+        var headers: [String: String] = [:]
+        var lengths: Set<String> = []
+        for line in lines {
+            guard let colon = line.firstIndex(of: ":"), colon != line.startIndex,
+                  !line[..<colon].contains(where: { $0 == " " || $0 == "\t" }) else {
+                return .failure(Failure(reason: "malformed header line"))
+            }
+            let name = String(line[..<colon]).lowercased()
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            if name == "content-length" { lengths.insert(value) }
+            headers[name] = value
+        }
+        guard headers["transfer-encoding"] == nil else { return .failure(Failure(reason: "Transfer-Encoding is not supported")) }
+        var contentLength = 0
+        if !lengths.isEmpty {
+            guard lengths.count == 1, let value = lengths.first, !value.isEmpty, value.count <= 10,
+                  value.allSatisfy({ $0.isASCII && $0.isNumber }), let parsed = Int(value) else {
+                return .failure(Failure(reason: "invalid Content-Length"))
+            }
+            guard parsed <= maxBodyLength else { return .failure(Failure(reason: "body too large")) }
+            contentLength = parsed
+        }
+        return .success(RequestHead(method: String(requestLine[0]), target: String(requestLine[1]), headers: headers, contentLength: contentLength))
+    }
+}
+
+extension ResponsePlan {
+    static func text(_ status: Int, _ message: String) -> ResponsePlan {
+        let body = Data((message + "\n").utf8)
+        return ResponsePlan(status: status, headers: [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", "\(body.count)")], body: body)
     }
 }
 
