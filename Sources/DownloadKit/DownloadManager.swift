@@ -227,6 +227,10 @@ public final class DownloadManager: Sendable {
     /// once per interval. It buffers only the newest list, so a slow consumer skips
     /// intermediate lists instead of growing memory. Ending the iteration in any way,
     /// including `break`, unsubscribes and never affects transfers.
+    ///
+    /// A list is also delivered when only a manager-wide value changed: the
+    /// ``reconciliationStatus()`` or the persisted ``defaultPolicy()``. Such a list can equal the
+    /// previous one; read those values when a list arrives to stay current.
     public func snapshots() async -> DownloadSnapshotStream {
         DownloadSnapshotStream(engine: engine)
     }

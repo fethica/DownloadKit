@@ -15,19 +15,30 @@ import DownloadKitUI
 import FRadioPlayer
 #endif
 
+/// Plays one item at a time. The list model owns the playback lease (one at a time, newest
+/// request wins, see `DownloadListModel.beginPlayback(of:)`); this type only drives the
+/// player and asks the model to end the lease when playback stops, fails or the screen goes
+/// away.
 @MainActor
-final class SamplePlayer: ObservableObject {
+final class SamplePlayer: NSObject, ObservableObject {
     @Published var offlineOnly = true
     @Published private(set) var nowPlaying: String?
     @Published private(set) var message: String?
-    private var lease: LocalFileLease?
+    /// Whether the player plays a leased local file (as opposed to a stream or nothing).
+    private var playingLocalFile = false
+    private weak var list: DownloadListModel?
 
     #if canImport(FRadioPlayer)
     static let isAvailable = true
+    private var observing = false
     private var player: FRadioPlayer {
         let player = FRadioPlayer.shared
         // Artwork lookups go to the network; a local file must not.
         player.enableArtwork = false
+        if !observing {
+            observing = true
+            player.addObserver(self)
+        }
         return player
     }
     #else
@@ -35,12 +46,15 @@ final class SamplePlayer: ObservableObject {
     #endif
 
     func play(_ item: FixtureItem, list: DownloadListModel, remoteURL: URL?, log: EventLog) async {
-        await stop(list: list)
+        self.list = list
+        stopPlayer()
         guard let id = try? DownloadID(item.id) else { return }
-        switch await list.openLocalFile(for: id) {
+        // `nil`: a later Play or Stop took over while this lookup ran; its lease, if any, is
+        // already ended.
+        guard let access = await list.beginPlayback(of: id) else { return }
+        switch access {
         case .available(let lease):
-            self.lease = lease
-            start(lease.url)
+            start(lease.url, local: true)
             nowPlaying = item.title
             message = "Playing the downloaded file"
             log.record("play \(item.id): local file")
@@ -50,7 +64,7 @@ final class SamplePlayer: ObservableObject {
                 message = "\(item.title) is not available offline (\(why)). Nothing was fetched."
                 log.record("play \(item.id): offline only, \(why), nothing fetched")
             } else if let remoteURL {
-                start(remoteURL)
+                start(remoteURL, local: false)
                 nowPlaying = item.title
                 message = "No local file (\(why)); playing from the network"
                 log.record("play \(item.id): \(why), streaming from the server")
@@ -65,17 +79,28 @@ final class SamplePlayer: ObservableObject {
     }
 
     func stop(list: DownloadListModel) async {
+        stopPlayer()
+        await list.endPlayback()
+    }
+
+    /// The model ended the playback lease on its own (the item is being removed): the file
+    /// may disappear, so the player stops too.
+    func playbackLeaseChanged(_ lease: LocalFileLease?) {
+        guard lease == nil, playingLocalFile else { return }
+        stopPlayer()
+        message = "Stopped: the item is being removed"
+    }
+
+    private func stopPlayer() {
         #if canImport(FRadioPlayer)
         if nowPlaying != nil { player.stop() }
         #endif
         nowPlaying = nil
-        if let lease {
-            self.lease = nil
-            await list.endAccess(lease)
-        }
+        playingLocalFile = false
     }
 
-    private func start(_ url: URL) {
+    private func start(_ url: URL, local: Bool) {
+        playingLocalFile = local
         #if canImport(FRadioPlayer)
         player.radioURL = url
         player.play()
@@ -93,6 +118,19 @@ final class SamplePlayer: ObservableObject {
         }
     }
 }
+
+#if canImport(FRadioPlayer)
+extension SamplePlayer: FRadioPlayerObserver {
+    /// A player error ends playback and its lease.
+    func radioPlayer(_ player: FRadioPlayer, playerStateDidChange state: FRadioPlayer.State) {
+        guard state == .error, nowPlaying != nil, let list else { return }
+        Task {
+            await stop(list: list)
+            message = "Playback failed; the file was released"
+        }
+    }
+}
+#endif
 
 struct PlayerView: View {
     @EnvironmentObject private var downloads: SampleDownloads
@@ -147,6 +185,10 @@ struct PlayerView: View {
         }
         .navigationViewStyle(.stack)
         .task { await list.observe() }
+        .onReceive(downloads.list.$playbackLease) { player.playbackLeaseChanged($0) }
+        // Leaving the screen ends playback and its lease, so a hidden player never holds a
+        // removal.
+        .onDisappear { Task { await player.stop(list: downloads.list) } }
     }
 
     private func status(of item: FixtureItem) -> String {

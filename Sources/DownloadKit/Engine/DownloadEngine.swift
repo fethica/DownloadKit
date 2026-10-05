@@ -105,7 +105,11 @@ actor DownloadEngine {
     private var recoveredFinalizations: [AttemptKey: RelativePath] = [:]
     /// Callers of ``detach()`` waiting for running finalisers to return.
     private var drainWaiters: [CheckedContinuation<Void, Never>] = []
-    private var fence: Fence = .notStarted
+    /// A change is a publishable change: subscribers read ``reconciliationStatus()`` when a list
+    /// arrives, so a fence that moves without any record changing still produces a list.
+    private var fence: Fence = .notStarted {
+        didSet { if fence != oldValue { stateVersion += 1 } }
+    }
     private var fenceTimer: Task<Void, Never>?
     private var consumers: [Task<Void, Never>] = []
     private var flushTask: Task<Void, Never>?

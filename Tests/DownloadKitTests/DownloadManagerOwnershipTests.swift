@@ -315,6 +315,53 @@ final class DownloadManagerOwnershipTests: XCTestCase {
 
     // MARK: reconciliation fence and wake budget
 
+    func testFenceChangesAloneAreDeliveredToSubscribers() async throws {
+        let sessionIdentifier = Harness.uniqueName("session")
+        var machine = DownloadStateMachine.fresh(session: sessionIdentifier)
+        _ = try machine.handle(.enqueue(makeRequest("a")), now: referenceDate)
+        let store = InMemoryIndexStore(contents: contents(of: machine))
+        let session = FakeTransferSession(identifier: sessionIdentifier, deliversBacklogMarker: false)
+        let harness = try Harness(sessionIdentifier: sessionIdentifier, store: store, session: session, reconciliationTimeout: 5)
+        let manager = harness.makeManager()
+        try await manager.start()
+
+        let recorder = ListRecorder()
+        let stream = await manager.snapshots()
+        let reader = Task { for await list in stream { await recorder.append(list) } }
+        await eventually("current list") { await recorder.count == 1 }
+
+        // The deadline changes the status and no record.
+        await harness.clock.advance(by: 5)
+        await eventually("the timeout alone delivers a list") { await recorder.count == 2 }
+        let status = await manager.reconciliationStatus()
+        XCTAssertEqual(status, .unresolved(items: [itemID("a")], reason: .deadlineExceeded))
+        let lists = await recorder.lists
+        XCTAssertEqual(lists[1], lists[0], "the items did not change")
+
+        // A late marker resolves the fence.
+        await session.emit(payload: .backlogDelivered)
+        await eventually("the resolution delivers a list") { await recorder.count >= 3 }
+        let resolved = await manager.reconciliationStatus()
+        XCTAssertEqual(resolved, .resolved)
+        reader.cancel()
+    }
+
+    func testDefaultPolicyChangeAloneIsDeliveredToSubscribers() async throws {
+        let harness = try Harness()
+        let manager = harness.makeManager()
+        try await manager.start()
+        let recorder = ListRecorder()
+        let stream = await manager.snapshots()
+        let reader = Task { for await list in stream { await recorder.append(list) } }
+        await eventually("current list") { await recorder.count == 1 }
+
+        try await manager.setDefaultPolicy(.anyNetwork)
+        await eventually("the policy change delivers a list") { await recorder.count == 2 }
+        let lists = await recorder.lists
+        XCTAssertEqual(lists, [[], []])
+        reader.cancel()
+    }
+
     func testWithheldBacklogMarkerLeavesIntentUnresolvedAtTheDeadline() async throws {
         let sessionIdentifier = Harness.uniqueName("session")
         var machine = DownloadStateMachine.fresh(session: sessionIdentifier)
@@ -967,4 +1014,11 @@ final class DownloadManagerOwnershipTests: XCTestCase {
         XCTAssertFalse(deleted)
         XCTAssertFalse(closed.contains(old))
     }
+}
+
+/// Collects the lists a snapshot subscription delivers.
+private actor ListRecorder {
+    private(set) var lists: [[DownloadSnapshot]] = []
+    var count: Int { lists.count }
+    func append(_ list: [DownloadSnapshot]) { lists.append(list) }
 }

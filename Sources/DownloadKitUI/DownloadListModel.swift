@@ -28,6 +28,11 @@ import DownloadKit
 /// ends with it. Neither affects transfers, and the manager keeps running. The model holds the
 /// manager strongly but never starts, detaches or releases it.
 ///
+/// Each list that arrives also refreshes the manager-wide values, ``banner`` (from the
+/// reconciliation status) and ``defaultPolicy``: the manager delivers a list when one of them
+/// changes even if no item did, so a policy set elsewhere in the app or a reconciliation that
+/// times out or resolves quietly shows up without an explicit refresh.
+///
 /// Publishing is bounded twice: the manager's stream delivers at most one list per
 /// ``DownloadKit/DownloadConfiguration/snapshotInterval`` and keeps only the newest, and the
 /// model publishes only when the presentation changed (progress is rounded to
@@ -50,6 +55,9 @@ public final class DownloadListModel: ObservableObject {
     @Published public var pendingRemoval: DownloadRemovalRequest?
     /// Whether at least one ``observe()`` call is running.
     @Published public private(set) var isObserving = false
+    /// The lease held for playback by ``beginPlayback(of:)``, or `nil`. It becomes `nil` when
+    /// playback ends, including when the item is removed; stop the player when it does.
+    @Published public private(set) var playbackLease: LocalFileLease?
 
     /// The latest raw snapshots. Not published on its own: views should read ``items``.
     public private(set) var snapshots: [DownloadSnapshot] = []
@@ -60,6 +68,9 @@ public final class DownloadListModel: ObservableObject {
     private var observations = 0
     private var startFailure: DownloadCommandFailure.Reason?
     private var leases: [LocalFileLease] = []
+    /// Advanced by every playback request and stop; a lookup that finishes under an older
+    /// value is obsolete and its lease is ended at once.
+    private var playbackToken: UInt64 = 0
 
     /// Creates a model for `controller`, usually the app's ``DownloadKit/DownloadManager``.
     public init(controller: any DownloadControlling, progressStep: Double = 0.01, byteStep: Int64 = 65_536) {
@@ -101,7 +112,8 @@ public final class DownloadListModel: ObservableObject {
             for try await list in sequence {
                 if Task.isCancelled { break }
                 let status = await controller.reconciliationStatus()
-                await model.receive(list, status: status)
+                let policy = await controller.defaultPolicy()
+                await model.receive(list, status: status, policy: policy)
             }
         } catch {
             // A throwing sequence ended; the subscription is over either way.
@@ -115,9 +127,11 @@ public final class DownloadListModel: ObservableObject {
         if items != self.items { self.items = items }
     }
 
-    func receive(_ snapshots: [DownloadSnapshot], status: ReconciliationStatus) {
+    func receive(_ snapshots: [DownloadSnapshot], status: ReconciliationStatus, policy: NetworkPolicy? = nil) {
         apply(snapshots)
         updateBanner(DownloadBanner(status: status))
+        if let policy, policy != defaultPolicy { defaultPolicy = policy }
+        endPlaybackIfRemoved(by: snapshots)
     }
 
     private func updateBanner(_ fromStatus: DownloadBanner?) {
@@ -189,8 +203,15 @@ public final class DownloadListModel: ObservableObject {
     public func confirmRemoval() async {
         guard let request = pendingRemoval else { return }
         pendingRemoval = nil
+        var removed = false
         await run(.remove, ids: request.ids) { controller in
             try await controller.remove(request.ids)
+            removed = true
+        }
+        // The removal waits for leases; the playback lease of a removed item is ended here so
+        // the removal can finish.
+        if removed, let lease = playbackLease, request.ids.contains(lease.id) {
+            await releasePlaybackLease()
         }
     }
 
@@ -279,11 +300,62 @@ public final class DownloadListModel: ObservableObject {
         await controller.endAccess(lease)
     }
 
-    /// Ends every lease this model handed out.
+    /// Ends every lease this model handed out, the playback lease included, and makes any
+    /// playback lookup still in flight obsolete.
     public func endAllAccess() async {
+        playbackToken &+= 1
+        playbackLease = nil
         let open = leases
         leases.removeAll()
         guard let controller else { return }
         for lease in open { await controller.endAccess(lease) }
+    }
+
+    // MARK: Playback
+
+    /// Resolves `id`'s validated local file for playback and holds its lease as
+    /// ``playbackLease``, the only playback lease of this model.
+    ///
+    /// The previous playback lease is ended first, whatever item it was for. The newest call
+    /// wins: a call overtaken by a later ``beginPlayback(of:)`` or ``endPlayback()`` while its
+    /// lookup was in flight returns `nil`, and the lease its lookup produced is ended at once,
+    /// so a burst of taps leaves at most one lease. A `nil` result means "do nothing": a newer
+    /// request owns playback. Nothing is fetched from the network.
+    public func beginPlayback(of id: DownloadID) async -> LocalFileAccess? {
+        playbackToken &+= 1
+        let token = playbackToken
+        await releasePlaybackLease()
+        guard token == playbackToken else { return nil }
+        let access = await openLocalFile(for: id)
+        guard token == playbackToken else {
+            if case .available(let lease) = access { await endAccess(lease) }
+            return nil
+        }
+        if case .available(let lease) = access { playbackLease = lease }
+        return access
+    }
+
+    /// Ends the playback lease, if any, and makes a playback lookup still in flight obsolete.
+    /// Calling it again does nothing. Call it when the player stops or fails, and when the
+    /// screen that owns playback goes away.
+    public func endPlayback() async {
+        playbackToken &+= 1
+        await releasePlaybackLease()
+    }
+
+    private func releasePlaybackLease() async {
+        guard let lease = playbackLease else { return }
+        playbackLease = nil
+        await endAccess(lease)
+    }
+
+    /// A playback lease on an item that is now being removed would hold the removal; it is
+    /// ended. While a lease is held no playback lookup is in flight (each one releases the
+    /// lease first), so no newer request is overtaken here.
+    private func endPlaybackIfRemoved(by snapshots: [DownloadSnapshot]) {
+        guard let lease = playbackLease,
+              snapshots.contains(where: { $0.id == lease.id && $0.state == .removing }) else { return }
+        playbackLease = nil
+        Task { await self.endAccess(lease) }
     }
 }

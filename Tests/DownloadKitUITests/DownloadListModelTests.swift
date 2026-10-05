@@ -44,6 +44,46 @@ final class DownloadListModelTests: XCTestCase {
         await task.value
     }
 
+    func testStatusChangeWithAnUnchangedListUpdatesTheBanner() async throws {
+        let fake = FakeController()
+        await fake.setStatus(.awaitingBacklog(deadline: Date()))
+        let model = DownloadListModel(controller: fake)
+        let task = try await observing(model, fake)
+        let list = [snapshot("a", .queued, title: "A")]
+        await fake.send(list)
+        let restoring = await eventually { model.banner == .restoring }
+        XCTAssertTrue(restoring)
+
+        // The manager delivers the same list when only its reconciliation status moved.
+        await fake.setStatus(.unresolved(items: [id("a")], reason: .deadlineExceeded))
+        await fake.send(list)
+        let unresolved = await eventually { model.banner != .restoring && model.banner != nil }
+        XCTAssertTrue(unresolved, "a timeout without an item change replaces the spinner")
+
+        await fake.setStatus(.resolved)
+        await fake.send(list)
+        let cleared = await eventually { model.banner == nil }
+        XCTAssertTrue(cleared, "a quiet resolution clears the banner")
+        task.cancel()
+        await task.value
+    }
+
+    func testPolicySetOutsideTheModelIsPublished() async throws {
+        let fake = FakeController()
+        let model = DownloadListModel(controller: fake)
+        let task = try await observing(model, fake)
+        XCTAssertEqual(model.defaultPolicy, .default)
+
+        let deferred = NetworkPolicy(allowsCellular: true, allowsExpensive: true, allowsConstrained: true, scheduling: .deferred)
+        await fake.setPolicy(deferred)
+        await fake.send([])
+        let updated = await eventually { model.defaultPolicy == deferred }
+        XCTAssertTrue(updated)
+        XCTAssertEqual(model.policyChoice, .anyNetwork)
+        task.cancel()
+        await task.value
+    }
+
     func testProgressBelowTheStepDoesNotPublish() async throws {
         let fake = FakeController()
         let model = DownloadListModel(controller: fake)
