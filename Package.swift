@@ -5,6 +5,7 @@ import PackageDescription
 
 let package = Package(
     name: "DownloadKit",
+    defaultLocalization: "en",
     platforms: [
         // The macOS entry exists only so the pure model and state tests run with `swift test`.
         // It says nothing about iOS background transfer behaviour.
@@ -26,7 +27,8 @@ let package = Package(
             dependencies: []),
         .target(
             name: "DownloadKitUI",
-            dependencies: ["DownloadKit"]),
+            dependencies: ["DownloadKit"],
+            resources: [.process("Resources")]),
         .testTarget(
             name: "DownloadKitTests",
             dependencies: ["DownloadKit"]),

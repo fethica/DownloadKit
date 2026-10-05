@@ -1,0 +1,113 @@
+/* DownloadKitUI English strings. A host overrides any key with a DownloadKitUI.strings table in its main bundle. */
+
+/* Accessibility label of the status indicator. */
+"indicator.label" = "Download status";
+
+/* Status lines, also read as accessibility values. */
+"status.notDownloaded" = "Not downloaded";
+"status.queued" = "Queued";
+"status.active" = "Downloading";
+/* %@: percentage, for example 42%. */
+"status.active.format" = "Downloading, %@";
+"status.waiting.networkPolicy" = "Waiting for an allowed network";
+"status.waiting.connectivity" = "Waiting for a connection";
+/* %@: time of the next attempt. */
+"status.waiting.retry.format" = "Trying again at %@";
+"status.waiting.system" = "Waiting for the system";
+"status.waiting.unknown" = "Waiting";
+"status.paused" = "Paused";
+"status.paused.fromStart" = "Paused, will start over";
+/* %@: percentage. */
+"status.paused.format" = "Paused at %@";
+/* %@: failure reason. */
+"status.failed.format" = "Failed: %@";
+"status.completed" = "Downloaded";
+"status.removing" = "Removing";
+"status.missing" = "File missing, download again";
+/* %1$@: received size, %2$@: total size. */
+"bytes.format" = "%1$@ of %2$@";
+
+/* Failure reasons. */
+"failure.unknown" = "unknown error";
+"failure.network" = "network error";
+/* %@: HTTP status code. */
+"failure.http.format" = "server error %@";
+"failure.storageFull" = "not enough storage";
+"failure.storage" = "storage error";
+"failure.fileProtection" = "the device is locked";
+"failure.integrity" = "the file is damaged";
+"failure.unauthorized" = "access expired";
+"failure.invalidResponse" = "not a media file";
+"failure.cancelled" = "cancelled";
+
+/* Action titles. */
+"action.download" = "Download";
+"action.pause" = "Pause";
+"action.resume" = "Resume";
+"action.cancel" = "Cancel Download";
+"action.retry" = "Retry";
+"action.remove" = "Remove Download";
+
+/* Accessibility labels of actions. %@: item title. */
+"action.download.format" = "Download %@";
+"action.pause.format" = "Pause %@";
+"action.resume.format" = "Resume %@";
+"action.cancel.format" = "Cancel download of %@";
+"action.retry.format" = "Retry %@";
+"action.remove.format" = "Remove download of %@";
+
+/* Accessibility hints of actions. */
+"hint.download" = "Saves the file on this device for offline listening.";
+"hint.pause" = "Keeps what was received so far when possible.";
+"hint.resume" = "Continues the download.";
+"hint.cancel" = "Stops the download. You can retry it later.";
+"hint.retry" = "Starts the download again.";
+"hint.remove" = "Deletes the downloaded file after confirmation.";
+
+/* Removal confirmation. %@: item or group title. */
+"remove.title.format" = "Remove %@?";
+"remove.title.generic" = "Remove these downloads?";
+"remove.message" = "The downloaded files are deleted from this device.";
+"remove.confirm" = "Remove";
+"remove.keep" = "Keep";
+"remove.group" = "Remove All";
+/* %@: group title. */
+"remove.group.format" = "Remove all downloads in %@";
+
+/* List. */
+"list.empty" = "No downloads";
+"list.ungrouped" = "Downloads";
+
+/* Network policy picker. */
+"policy.title" = "Download Over";
+"policy.unmeteredOnly" = "Unmetered networks";
+"policy.unmeteredIncludingLowData" = "Unmetered networks, Low Data Mode allowed";
+"policy.anyNetwork" = "Any network, cellular included";
+"policy.custom" = "Custom setting chosen by the app";
+"policy.footer" = "Unmetered means not cellular and not marked expensive. A network that is not expensive is not necessarily Wi-Fi.";
+
+/* Reconciliation banner. */
+"banner.restoring.title" = "Restoring downloads";
+"banner.restoring.detail" = "Checking which transfers finished while the app was closed.";
+"banner.unresolved.title" = "Some downloads are unconfirmed";
+/* %@: number of items. */
+"banner.unresolved.format" = "%@ downloads could not be confirmed yet. Nothing was lost; they are checked again on the next launch.";
+"banner.storage.title" = "Download storage is unavailable";
+/* %@: number of items. */
+"banner.storage.format" = "%@ downloads are waiting until storage can be read again.";
+"banner.start.title" = "Downloads could not start";
+
+/* Command failures. */
+"error.title" = "Download";
+"error.dismiss" = "OK";
+"error.notStarted" = "Downloads are still starting. Try again in a moment.";
+"error.itemBeingRemoved" = "This download is being removed.";
+"error.unknownItem" = "This download no longer exists.";
+"error.conflictingRequest" = "A different version of this item is already downloaded.";
+"error.persistenceFailed" = "The download list could not be saved. It is tried again automatically.";
+"error.reconciliationUnresolved" = "Some downloads are still being checked.";
+"error.storageUnavailable" = "Download storage is unavailable.";
+"error.unsupportedIndex" = "The download list cannot be read by this version of the app.";
+"error.fileAccessFailed" = "The file cannot be read right now. Unlock the device and try again.";
+"error.anotherOwner" = "Downloads are already managed elsewhere in the app.";
+"error.other" = "Something went wrong.";
