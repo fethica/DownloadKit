@@ -53,13 +53,3 @@ enum FinalizationResult: Sendable, Equatable {
 protocol DownloadFinalizing: Sendable {
     func finalize(_ request: FinalizationRequest) async -> FinalizationResult
 }
-
-/// The finaliser used until validation and atomic rename are implemented.
-///
-/// It never marks bytes completed: every captured file stays captured (journal `captured`), so
-/// nothing unvalidated becomes playable.
-struct DeferredFinalizer: DownloadFinalizing {
-    func finalize(_ request: FinalizationRequest) async -> FinalizationResult {
-        .deferred
-    }
-}

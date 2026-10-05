@@ -420,7 +420,11 @@ struct DownloadStateMachine: Sendable, Equatable {
             deferredResubmissions.remove(record.id)
             record.journal = .captured
             record.stagingPath = captured
-            record.finalizationDestination = .media(generation: record.generation)
+            // The extension comes only from response evidence a real transfer recorded.
+            record.finalizationDestination = .media(
+                generation: record.generation,
+                fileExtension: validators.flatMap { MediaFileExtension.infer(mediaType: $0.mediaType, sourceURL: record.request.sourceURL) }
+            )
             record.bytesWritten = max(0, bytes)
             record.validators = validators
             record.binding = nil

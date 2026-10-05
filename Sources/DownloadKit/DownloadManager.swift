@@ -38,8 +38,12 @@ public final class DownloadManager: Sendable {
     private let backgroundEvents: BackgroundEventsCoordinator
     private let host = EngineHost()
 
+    /// Creates a manager. Captured files are finalised by the package's validating finaliser
+    /// (evidence, length, content, optional checksum, then an atomic rename), using the
+    /// configuration's file system and clock.
     public convenience init(configuration: DownloadConfiguration, urlRefresher: (any URLRefreshing)? = nil) {
-        self.init(configuration: configuration, urlRefresher: urlRefresher, finalizer: DeferredFinalizer())
+        let dependencies = configuration.dependencies
+        self.init(configuration: configuration, urlRefresher: urlRefresher, finalizer: FileFinalizer(fileSystem: dependencies.fileSystem, clock: dependencies.clock))
     }
 
     init(configuration: DownloadConfiguration, urlRefresher: (any URLRefreshing)?, finalizer: any DownloadFinalizing) {

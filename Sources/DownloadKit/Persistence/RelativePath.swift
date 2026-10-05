@@ -37,9 +37,11 @@ public struct RelativePath: Hashable, Sendable, Codable, CustomStringConvertible
 
     public var description: String { rawValue }
 
-    /// The final location for the file completed by attempt `generation`.
-    static func media(generation: UInt64) -> RelativePath {
-        RelativePath(unchecked: "\(StorageLayout.mediaDirectory)/item-\(generation)")
+    /// The final location for the file completed by attempt `generation`, with an extension
+    /// from ``MediaFileExtension`` when one is known.
+    static func media(generation: UInt64, fileExtension: String? = nil) -> RelativePath {
+        let suffix = fileExtension.map { ".\($0)" } ?? ""
+        return RelativePath(unchecked: "\(StorageLayout.mediaDirectory)/item-\(generation)\(suffix)")
     }
 
     /// A unique staging location.
@@ -57,5 +59,31 @@ public struct RelativePath: Hashable, Sendable, Codable, CustomStringConvertible
         return value.split(separator: "/", omittingEmptySubsequences: false).allSatisfy { component in
             !component.isEmpty && component != "." && component != ".."
         }
+    }
+}
+
+/// The extension of a completed file, so a player that infers the format from the file name
+/// can open it. Only values from fixed allowlists are used: the response's declared media type
+/// first, then the source URL's extension. Never a server-provided file name.
+enum MediaFileExtension {
+    private static let byMediaType: [String: String] = [
+        "audio/mpeg": "mp3", "audio/mp3": "mp3",
+        "audio/mp4": "m4a", "audio/x-m4a": "m4a", "audio/m4a": "m4a",
+        "audio/aac": "aac", "audio/x-aac": "aac", "audio/aacp": "aac",
+        "audio/wav": "wav", "audio/x-wav": "wav", "audio/wave": "wav", "audio/vnd.wave": "wav",
+        "audio/aiff": "aiff", "audio/x-aiff": "aiff", "audio/x-caf": "caf",
+        "audio/flac": "flac", "audio/x-flac": "flac", "audio/ogg": "ogg",
+        "audio/webm": "webm", "video/webm": "webm",
+        "video/mp4": "mp4", "video/x-m4v": "m4v", "video/quicktime": "mov",
+    ]
+
+    private static let sourceExtensions: Set<String> = [
+        "mp3", "m4a", "m4b", "aac", "wav", "aif", "aiff", "caf", "flac", "ogg", "oga", "webm", "mp4", "m4v", "mov",
+    ]
+
+    static func infer(mediaType: String?, sourceURL: URL) -> String? {
+        if let mediaType, let known = byMediaType[mediaType.lowercased()] { return known }
+        let candidate = sourceURL.pathExtension.lowercased()
+        return sourceExtensions.contains(candidate) ? candidate : nil
     }
 }
