@@ -66,6 +66,7 @@ final class DownloadManagerRecoveryTests: XCTestCase {
         try await manager.start()
 
         await eventually("backlog acknowledged") { await session.acknowledged == 1 }
+        withExtendedLifetime(manager) {}
         let submissions = await session.submissions
         let stored = await store.contents?.records.first
         XCTAssertTrue(submissions.isEmpty, "the surviving task is adopted, not duplicated")
@@ -384,6 +385,7 @@ final class DownloadManagerRecoveryTests: XCTestCase {
 
         let duplicate = await harness.session.emit(payload: .backgroundEventsFinished)
         await eventually("duplicate marker applied") { await harness.session.acknowledged == duplicate }
+        withExtendedLifetime(manager) {}
         let calls = await MainActor.run { counter.count }
         let unrelatedCalls = await MainActor.run { unrelated.count }
         XCTAssertGreaterThan(duplicate, marker)

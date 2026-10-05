@@ -124,9 +124,12 @@ final class DownloadManagerLifecycleTests: XCTestCase {
 
         let newSession = FakeTransferSession(identifier: first.sessionIdentifier, liveTasks: [try XCTUnwrap(survivingTask)])
         let second = try Harness(namespace: first.namespace, sessionIdentifier: first.sessionIdentifier, fileSystem: first.fileSystem, store: first.store, session: newSession)
-        try await second.makeManager().start()
+        // The host keeps its manager; a released manager stops reading session events.
+        let restarted = second.makeManager()
+        try await restarted.start()
 
         await eventually("orphan resubmitted after the backlog") { await newSession.submissions.count == 1 }
+        withExtendedLifetime(restarted) {}
         let resubmitted = await newSession.submissions
         XCTAssertEqual(resubmitted.map(\.itemID), [itemID("b")])
         XCTAssertEqual(resubmitted.first?.generation, 3, "generations continue from the index")
