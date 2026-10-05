@@ -130,9 +130,19 @@ public struct TransferSessionEvent: Hashable, Sendable {
         /// has applied everything before this marker, it calls the host's completion handler
         /// registered through ``DownloadManager/handleBackgroundEvents(forSession:completionHandler:)``.
         case backgroundEventsFinished
+        /// The session could not read or store its durable backlog (an unreadable inbox, or a
+        /// terminal event or sequence reservation it could not write), so it withholds
+        /// ``backlogDelivered``. The manager reports reconciliation unresolved with
+        /// ``ReconciliationUnresolvedReason/sessionStorageFailed`` and concludes nothing; the
+        /// marker follows once the session recovered. It is not a new position in the stream:
+        /// its sequence repeats the last one delivered (0 when nothing was), and acknowledging it
+        /// releases nothing new.
+        case backlogUnavailable
     }
 
-    /// Strictly increasing per session; acknowledged with ``TransferSession/acknowledge(through:)``.
+    /// Strictly increasing per session across events and the two markers (except
+    /// ``Payload/backlogUnavailable``, which repeats the last number); acknowledged with
+    /// ``TransferSession/acknowledge(through:)``.
     public let sequence: UInt64
     public let payload: Payload
 

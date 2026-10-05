@@ -132,14 +132,15 @@ final class SQLiteIndexStoreTests: XCTestCase {
         let store = try open()
         try await store.apply(IndexChangeSet(upserts: everyShape(), nextGeneration: 10))
         await store.close()
-        try rawExecute("UPDATE dk_schema SET version = 2")
+        let newer = IndexSchema.currentVersion + 1
+        try rawExecute("UPDATE dk_schema SET version = \(newer)")
         let before = try Data(contentsOf: fileURL)
 
         XCTAssertThrowsError(try open()) { error in
-            XCTAssertEqual(error as? DownloadError, .unsupportedSchema(found: 2, supported: 1))
+            XCTAssertEqual(error as? DownloadError, .unsupportedSchema(found: newer, supported: IndexSchema.currentVersion))
         }
         XCTAssertEqual(try Data(contentsOf: fileURL), before)
-        XCTAssertEqual(try rawStrings("SELECT CAST(version AS TEXT) FROM dk_schema"), ["2"], "the version is not reset")
+        XCTAssertEqual(try rawStrings("SELECT CAST(version AS TEXT) FROM dk_schema"), ["\(newer)"], "the version is not reset")
     }
 
     func testUnreadableFileIsCorruptAndPreserved() throws {
@@ -305,6 +306,148 @@ final class SQLiteIndexStoreTests: XCTestCase {
         let store = try await SQLiteIndexStore.opener()(directory.url)
         try await store.apply(IndexChangeSet(nextGeneration: 2))
         XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
+    }
+
+    // MARK: Invalid indexes and migration
+
+    /// The bytes of the database and of its companion files, to prove a refusal wrote nothing.
+    private func snapshotFiles() -> [String: Data] {
+        var files: [String: Data] = [:]
+        for suffix in ["", "-wal", "-journal"] {
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: fileURL.path + suffix)) { files[suffix] = data }
+        }
+        return files
+    }
+
+    private func assertRefusedUnchanged(_ expected: DownloadError = .corruptIndex, file: StaticString = #filePath, line: UInt = #line) {
+        let before = snapshotFiles()
+        XCTAssertThrowsError(try open(), file: file, line: line) { error in
+            XCTAssertEqual(error as? DownloadError, expected, file: file, line: line)
+        }
+        XCTAssertEqual(snapshotFiles(), before, "a refused index is not modified", file: file, line: line)
+    }
+
+    func testPopulatedIndexWithoutItsCounterIsRefusedNotFresh() async throws {
+        let store = try open()
+        try await store.apply(IndexChangeSet(upserts: everyShape(), nextGeneration: 10, cleanupQueued: [path("staging/old")]))
+        await store.close()
+        try rawExecute("DELETE FROM dk_globals WHERE key = 'next_generation'")
+
+        assertRefusedUnchanged()
+        XCTAssertEqual(try rawStrings("SELECT id FROM dk_records").count, everyShape().count, "the records are kept")
+    }
+
+    func testContradictoryOrInconsistentRecordsAreRefused() async throws {
+        let store = try open()
+        try await store.apply(IndexChangeSet(upserts: everyShape(), nextGeneration: 10))
+        await store.close()
+        let original = try rawStrings("SELECT CAST(record AS TEXT) FROM dk_records WHERE id = 'completed'")[0]
+
+        // Decodes, but a completed record without a final path contradicts itself.
+        let contradictory = original.replacingOccurrences(of: "\"finalPath\":\"media\\/item-2\",", with: "").replacingOccurrences(of: "\"finalPath\":\"media/item-2\",", with: "")
+        XCTAssertNotEqual(contradictory, original)
+        try rawExecute("UPDATE dk_records SET record = CAST('\(contradictory)' AS BLOB) WHERE id = 'completed'")
+        assertRefusedUnchanged()
+
+        // A record whose generation is not below the stored counter.
+        try rawExecute("UPDATE dk_records SET record = CAST('\(original)' AS BLOB) WHERE id = 'completed'")
+        try rawExecute("UPDATE dk_globals SET value = 3 WHERE key = 'next_generation'")
+        assertRefusedUnchanged()
+
+        // A row whose columns disagree with its record.
+        try rawExecute("UPDATE dk_globals SET value = 10 WHERE key = 'next_generation'")
+        try rawExecute("UPDATE dk_records SET generation = 7 WHERE id = 'completed'")
+        assertRefusedUnchanged()
+    }
+
+    func testCorruptIndexInRollbackJournalModeIsRefusedWithoutAnyWrite() throws {
+        // A version 1 index written by another configuration in rollback-journal mode.
+        try rawExecute("""
+            PRAGMA journal_mode = DELETE;
+            CREATE TABLE dk_schema (version INTEGER NOT NULL);
+            INSERT INTO dk_schema (version) VALUES (1);
+            CREATE TABLE dk_globals (key TEXT PRIMARY KEY NOT NULL, value BLOB) WITHOUT ROWID;
+            CREATE TABLE dk_records (id TEXT PRIMARY KEY NOT NULL, generation INTEGER NOT NULL, journal TEXT NOT NULL, record BLOB NOT NULL) WITHOUT ROWID;
+            CREATE TABLE dk_cleanup (path TEXT PRIMARY KEY NOT NULL) WITHOUT ROWID;
+            INSERT INTO dk_globals (key, value) VALUES ('next_generation', 5);
+            INSERT INTO dk_records (id, generation, journal, record) VALUES ('a', 1, 'notStarted', CAST('{"id":"a"}' AS BLOB));
+            """)
+        let header = try Data(contentsOf: fileURL)
+        XCTAssertEqual(header[18], 1, "rollback-journal mode before")
+
+        assertRefusedUnchanged()
+        let after = try Data(contentsOf: fileURL)
+        XCTAssertEqual(after[18], 1, "the journal mode was not switched to WAL")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path + "-wal"))
+    }
+
+    func testVersionOneIndexIsMigratedAndKeepsItsRecords() async throws {
+        // Written by a version 1 build: no unresolved-attempt fields, version 1.
+        let store = try open()
+        let records = everyShape()
+        try await store.apply(IndexChangeSet(upserts: records, nextGeneration: 10))
+        await store.close()
+        for record in records {
+            var json = try rawStrings("SELECT CAST(record AS TEXT) FROM dk_records WHERE id = '\(record.id.rawValue)'")[0]
+            for field in ["\"policyChangeDeferred\":false,", "\"restartDeferred\":false,", "\"stoppedWhileUnconfirmed\":false,"] {
+                json = json.replacingOccurrences(of: field, with: "")
+            }
+            XCTAssertFalse(json.contains("Deferred"))
+            try rawExecute("UPDATE dk_records SET record = CAST('\(json)' AS BLOB) WHERE id = '\(record.id.rawValue)'")
+        }
+        try rawExecute("UPDATE dk_schema SET version = 1")
+
+        let migrated = try open()
+        let contents = try await migrated.load()
+        XCTAssertEqual(contents?.records, records.sorted { $0.id < $1.id }, "the new fields read as false")
+        XCTAssertEqual(try rawStrings("SELECT CAST(version AS TEXT) FROM dk_schema"), ["\(IndexSchema.currentVersion)"])
+        await migrated.close()
+
+        // The flags round-trip once written.
+        var flagged = record("paused-unconfirmed", phase: .paused)
+        flagged.stoppedWhileUnconfirmed = true
+        flagged.restartDeferred = true
+        flagged.policyChangeDeferred = true
+        let reopened = try open()
+        try await reopened.apply(IndexChangeSet(upserts: [flagged], nextGeneration: 10))
+        await reopened.close()
+        let reread = try await open().load()
+        XCTAssertEqual(reread?.records.first { $0.id == itemID("paused-unconfirmed") }, flagged)
+    }
+
+    func testEmptyDatabaseFileIsCreatedAfresh() async throws {
+        try Data().write(to: fileURL)
+        let store = try open()
+        let contents = try await store.load()
+        XCTAssertNil(contents)
+        try await store.apply(IndexChangeSet(upserts: [record("a", phase: .queued)], nextGeneration: 4))
+        await store.close()
+        let reread = try await open().load()
+        XCTAssertEqual(reread?.records.count, 1)
+    }
+
+    func testIndexReachedThroughASymbolicLinkIsRefused() async throws {
+        let outside = try TemporaryDirectory("sqlite-outside")
+        defer { outside.remove() }
+        let target = outside.appending("other.sqlite")
+        let elsewhere = try SQLiteIndexStore(fileURL: target)
+        try await elsewhere.apply(IndexChangeSet(upserts: [record("a", phase: .queued)], nextGeneration: 4))
+        await elsewhere.close()
+        let before = try Data(contentsOf: target)
+
+        try FileManager.default.createSymbolicLink(at: fileURL, withDestinationURL: target)
+        XCTAssertThrowsError(try open()) { error in
+            XCTAssertEqual(error as? DownloadError, .storageUnavailable)
+        }
+        XCTAssertEqual(try Data(contentsOf: target), before, "the other database is untouched")
+
+        // A link in place of the write-ahead log is refused too.
+        try FileManager.default.removeItem(at: fileURL)
+        try FileManager.default.createSymbolicLink(at: URL(fileURLWithPath: fileURL.path + "-wal"), withDestinationURL: outside.appending("log"))
+        XCTAssertThrowsError(try open()) { error in
+            XCTAssertEqual(error as? DownloadError, .storageUnavailable)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appending("log").path))
     }
 
     // MARK: Raw access

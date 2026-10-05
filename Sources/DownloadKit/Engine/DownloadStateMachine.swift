@@ -80,12 +80,16 @@ struct DownloadStateMachine: Sendable, Equatable {
     /// such an attempt is not proof that the attempt ended, so path and policy changes only
     /// change its explanation and never create a replacement.
     private(set) var unconfirmed: [DownloadID: UInt64] = [:]
-    /// Policy changes held back for an unconfirmed attempt, applied once it is resolved.
+    /// Policy changes held back for an unconfirmed attempt, applied once it is resolved
+    /// (persisted as ``IndexRecord/policyChangeDeferred``).
     private(set) var deferredResubmissions: Set<DownloadID> = []
     /// Resume or retry commands for a stopped attempt that is still unconfirmed. The stopped
     /// state is kept and no replacement is created until the old attempt's disposition is
-    /// known: its task is found (it is then adopted as the restarted attempt), its completion
-    /// arrives (it is then finalised), or its end is proven (only then a new attempt starts).
+    /// known: its task is found (it is then adopted as the restarted attempt, unless a policy
+    /// change is held, which restarts it under the current policy), its completion arrives (it
+    /// is then finalised), or its end is proven (only then a new attempt starts). Persisted as
+    /// ``IndexRecord/restartDeferred``; the stop itself as ``IndexRecord/stoppedWhileUnconfirmed``,
+    /// so all three survive a relaunch.
     private(set) var deferredRestarts: Set<DownloadID> = []
     let sessionIdentifier: String
     let retryPolicy: RetryPolicy
@@ -101,6 +105,14 @@ struct DownloadStateMachine: Sendable, Equatable {
             }
             if record.phase.isAwaitingTransfer, record.journal != .captured {
                 unconfirmed[record.id] = record.generation
+            }
+            if record.stoppedWhileUnconfirmed, record.binding == nil, record.journal != .captured, Self.isStopped(record.phase) {
+                // Stopped before its task was confirmed, in an earlier process: still unproven.
+                unconfirmed[record.id] = record.generation
+                if record.restartDeferred { deferredRestarts.insert(record.id) }
+            }
+            if record.policyChangeDeferred, unconfirmed[record.id] == record.generation {
+                deferredResubmissions.insert(record.id)
             }
             records[record.id] = record
         }
@@ -172,6 +184,7 @@ struct DownloadStateMachine: Sendable, Equatable {
 
         case .remove(let id):
             deferredRestarts.remove(id)
+            deferredResubmissions.remove(id)
             guard var record = records[id], record.phase != .removing else { break }
             stopTransfer(&record, producingResumeData: false, into: &outcome)
             record.generation = allocateGeneration()
@@ -205,6 +218,7 @@ struct DownloadStateMachine: Sendable, Equatable {
             record.request.sourceURL = url
             save(record, now: now, into: &outcome)
         }
+        persistDeferredState(now: now, into: &outcome)
         return outcome
     }
 
@@ -377,6 +391,7 @@ struct DownloadStateMachine: Sendable, Equatable {
             guard cleanup.remove(path) != nil else { break }
             outcome.cleanupCompleted.insert(path)
         }
+        persistDeferredState(now: now, into: &outcome)
         return outcome
     }
 
@@ -392,10 +407,19 @@ struct DownloadStateMachine: Sendable, Equatable {
             record.phase = .active
             record.bytesWritten = max(0, bytes)
             if let expected, expected > 0 { record.expectedBytes = expected }
-            if record.binding == nil {
+            let discovered = record.binding == nil
+            if discovered {
                 record.binding = TaskBinding(sessionIdentifier: sessionIdentifier, taskIdentifier: reference.taskIdentifier, generation: reference.generation)
             }
             save(record, now: now, into: &outcome)
+            if discovered {
+                // Progress proves the task like a binding does: a policy change held for the
+                // unconfirmed attempt is enforced now, once.
+                unconfirmed[record.id] = nil
+                if deferredResubmissions.remove(record.id) != nil {
+                    resubmitForPolicyChange(record.id, now: now, into: &outcome)
+                }
+            }
 
         case .waiting(let reference, let reason):
             if let record = records[reference.itemID], record.generation == reference.generation, isStoppedAndUnconfirmed(record) {
@@ -564,10 +588,7 @@ struct DownloadStateMachine: Sendable, Equatable {
     /// a task of that attempt may still run, and its completion may still arrive.
     func isStoppedAndUnconfirmed(_ record: IndexRecord) -> Bool {
         guard isUnconfirmed(record), record.binding == nil, record.journal != .captured else { return false }
-        switch record.phase {
-        case .paused, .failed: return true
-        default: return false
-        }
+        return Self.isStopped(record.phase)
     }
 
     /// Holds a resume or retry of a stopped, unconfirmed attempt instead of replacing it.
@@ -580,26 +601,70 @@ struct DownloadStateMachine: Sendable, Equatable {
 
     /// The task of a stopped, unconfirmed attempt was found. A restart asked for meanwhile
     /// adopts it; otherwise the stop is enforced against exactly that task.
+    ///
+    /// A policy change held for the attempt is consumed here, exactly once. The found task was
+    /// created under the old policy and cannot be narrowed, so it is never adopted then: it is
+    /// cancelled, and when a restart was asked for a new attempt starts under the current policy.
     private mutating func stoppedAttemptFound(_ record: IndexRecord, taskIdentifier: Int, now: Date, into outcome: inout Outcome) {
         var record = record
         unconfirmed[record.id] = nil
         let binding = TaskBinding(sessionIdentifier: sessionIdentifier, taskIdentifier: taskIdentifier, generation: record.generation)
-        if deferredRestarts.remove(record.id) != nil {
+        let policyChanged = deferredResubmissions.remove(record.id) != nil
+        let restartWaited = deferredRestarts.remove(record.id) != nil
+        if restartWaited, !policyChanged {
             record.phase = submissionPhase(for: record)
             record.binding = binding
-        } else {
-            record.stoppingBinding = binding
-            outcome.effects.append(.cancelTask(record.id, taskIdentifier: taskIdentifier, producingResumeData: true))
+            save(record, now: now, into: &outcome)
+            return
         }
+        record.stoppingBinding = binding
+        outcome.effects.append(.cancelTask(record.id, taskIdentifier: taskIdentifier, producingResumeData: true))
         save(record, now: now, into: &outcome)
+        if restartWaited {
+            submit(record.id, now: now, into: &outcome)
+        }
     }
 
     /// A stopped, unconfirmed attempt provably ended without a capture. Only now does a
     /// deferred restart create a new attempt.
     private mutating func stoppedAttemptEnded(_ record: IndexRecord, now: Date, into outcome: inout Outcome) {
         unconfirmed[record.id] = nil
+        // A new attempt (if any) is created under the current policy anyway.
+        deferredResubmissions.remove(record.id)
         if deferredRestarts.remove(record.id) != nil {
             submit(record.id, now: now, into: &outcome)
+        }
+    }
+
+    static func isStopped(_ phase: RecordPhase) -> Bool {
+        switch phase {
+        case .paused, .failed: return true
+        default: return false
+        }
+    }
+
+    /// Writes the in-memory dispositions that must survive a relaunch into their records:
+    /// ``IndexRecord/stoppedWhileUnconfirmed``, ``IndexRecord/restartDeferred`` and
+    /// ``IndexRecord/policyChangeDeferred``. Runs at the end of every command and event, so
+    /// they are committed in the same change set as the transition that set or cleared them.
+    /// Entries that no longer describe an unconfirmed attempt are dropped first.
+    private mutating func persistDeferredState(now: Date, into outcome: inout Outcome) {
+        for id in deferredRestarts where !(records[id].map(isStoppedAndUnconfirmed) ?? false) {
+            deferredRestarts.remove(id)
+        }
+        for id in deferredResubmissions where !(records[id].map(isUnconfirmed) ?? false) {
+            deferredResubmissions.remove(id)
+        }
+        for id in records.keys.sorted() {
+            guard var record = records[id] else { continue }
+            let stopped = isStoppedAndUnconfirmed(record)
+            let restart = deferredRestarts.contains(id)
+            let policy = deferredResubmissions.contains(id)
+            guard record.stoppedWhileUnconfirmed != stopped || record.restartDeferred != restart || record.policyChangeDeferred != policy else { continue }
+            record.stoppedWhileUnconfirmed = stopped
+            record.restartDeferred = restart
+            record.policyChangeDeferred = policy
+            save(record, now: now, into: &outcome)
         }
     }
 
@@ -645,6 +710,12 @@ struct DownloadStateMachine: Sendable, Equatable {
     }
 
     private mutating func resubmitForPolicyChange(_ id: DownloadID, now: Date, into outcome: inout Outcome) {
+        if let record = records[id], isStoppedAndUnconfirmed(record) {
+            // Stopped while its task may still run under the old policy: hold the change so the
+            // task is not adopted under it when a restart finds it.
+            deferredResubmissions.insert(id)
+            return
+        }
         guard var record = records[id], record.phase.isAwaitingTransfer, record.journal != .captured else { return }
         if record.binding == nil, isUnconfirmed(record) {
             // The task, if any, cannot be cancelled yet and its completion may still arrive:

@@ -32,4 +32,8 @@ public enum ReconciliationUnresolvedReason: String, Hashable, Sendable {
     case deadlineExceeded
     /// The session's event stream finished without the backlog marker.
     case sessionEnded
+    /// The session reported that it could not read or store its durable backlog
+    /// (``TransferSessionEvent/Payload/backlogUnavailable``). Nothing is concluded until its
+    /// backlog marker arrives; ``DownloadManager/flushPendingWork()`` keeps reporting it.
+    case sessionStorageFailed
 }

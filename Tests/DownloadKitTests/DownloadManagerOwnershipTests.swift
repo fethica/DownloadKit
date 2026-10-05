@@ -788,4 +788,183 @@ final class DownloadManagerOwnershipTests: XCTestCase {
         let submissions = await harness.session.submissions
         XCTAssertFalse(submissions.contains { $0.itemID == itemID("a") }, "a timeout is not proof of absence")
     }
+
+    // MARK: unresolved stops across a relaunch
+
+    /// Stops the restored unconfirmed attempt, optionally asks for the restart, and ends the
+    /// process. The next launch's session buffers nothing yet and withholds its marker.
+    private func relaunchAfterStop(_ pair: RestartPair, restartBeforeExit: Bool) async throws -> (Harness, DownloadManager, UInt64) {
+        let (first, manager, generation) = try await unconfirmedAttempt()
+        switch pair {
+        case .pauseThenResume:
+            try await manager.pause(itemID("a"))
+            if restartBeforeExit { try await manager.resume(itemID("a")) }
+        case .cancelThenRetry:
+            try await manager.cancel(itemID("a"))
+            if restartBeforeExit { try await manager.retry(itemID("a")) }
+        }
+        await manager.detach()
+        let next = try restart(first, session: FakeTransferSession(identifier: first.sessionIdentifier, deliversBacklogMarker: false))
+        let relaunched = next.makeManager()
+        try await relaunched.start()
+        return (next, relaunched, generation)
+    }
+
+    private func assertBufferedCompletionSurvivesTheRelaunch(_ pair: RestartPair, restartBeforeExit: Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
+        let (harness, manager, generation) = try await relaunchAfterStop(pair, restartBeforeExit: restartBeforeExit)
+        if !restartBeforeExit {
+            // The restart arrives early: before the backlog of the new launch was delivered.
+            switch pair {
+            case .pauseThenResume: try await manager.resume(itemID("a"))
+            case .cancelThenRetry: try await manager.retry(itemID("a"))
+            }
+        }
+        let early = await harness.session.submissions
+        let stored = await harness.store.contents?.records.first
+        XCTAssertTrue(early.isEmpty, "no replacement before the old attempt's disposition is known", file: file, line: line)
+        XCTAssertEqual(stored?.generation, generation, file: file, line: line)
+        XCTAssertEqual(stored?.stoppedWhileUnconfirmed, true, file: file, line: line)
+        XCTAssertEqual(stored?.restartDeferred, true, file: file, line: line)
+
+        // The old attempt's completion was buffered across the relaunch.
+        let captured = path("staging/buffered")
+        await harness.fileSystem.putFile(harness.url(captured), size: 10)
+        let sequence = await harness.session.emit(.finished(reference("a", generation: generation, task: 55), captured: captured, bytes: 10, validators: nil))
+        await eventually("buffered completion applied", file: file, line: line) { await harness.session.acknowledged == sequence }
+        await settle(manager)
+        let marker = await harness.session.emit(payload: .backlogDelivered)
+        await eventually("marker applied", file: file, line: line) { await harness.session.acknowledged == marker }
+
+        let state = await manager.state(for: itemID("a"))
+        let cleanup = await harness.store.contents?.cleanupPaths ?? []
+        let finalExists = await harness.fileSystem.hasFile(harness.url(.media(generation: generation)))
+        let submissions = await harness.session.submissions
+        guard case .completed = state else { return XCTFail("expected completed, got \(state)", file: file, line: line) }
+        XCTAssertFalse(cleanup.contains(captured), "the buffered capture is never queued for deletion", file: file, line: line)
+        XCTAssertTrue(finalExists, file: file, line: line)
+        XCTAssertTrue(submissions.isEmpty, file: file, line: line)
+    }
+
+    func testPauseExitStartThenEarlyResumeKeepsTheBufferedCompletion() async throws {
+        try await assertBufferedCompletionSurvivesTheRelaunch(.pauseThenResume, restartBeforeExit: false)
+    }
+
+    func testCancelExitStartThenEarlyRetryKeepsTheBufferedCompletion() async throws {
+        try await assertBufferedCompletionSurvivesTheRelaunch(.cancelThenRetry, restartBeforeExit: false)
+    }
+
+    func testDeferredResumeBeforeExitKeepsTheBufferedCompletion() async throws {
+        try await assertBufferedCompletionSurvivesTheRelaunch(.pauseThenResume, restartBeforeExit: true)
+    }
+
+    func testDeferredRetryBeforeExitStartsOneAttemptOnceTheNextBacklogProvesTheOldOneGone() async throws {
+        let (harness, manager, generation) = try await relaunchAfterStop(.cancelThenRetry, restartBeforeExit: true)
+        let status = await manager.reconciliationStatus()
+        XCTAssertEqual(status, .awaitingBacklog(deadline: referenceDate.addingTimeInterval(20)), "the restored stop is fenced")
+
+        await harness.session.emit(payload: .backlogDelivered)
+        await eventually("marker applied") { await manager.reconciliationStatus() == .resolved }
+
+        let submissions = await harness.session.submissions
+        XCTAssertEqual(submissions.map(\.generation), [generation + 1], "exactly one continuation")
+        let stored = await harness.store.contents?.records.first
+        XCTAssertEqual(stored?.stoppedWhileUnconfirmed, false)
+        XCTAssertEqual(stored?.restartDeferred, false)
+    }
+
+    func testRestoredStopFoundAsALiveTaskIsAdoptedByTheDeferredResume() async throws {
+        let (first, manager, generation) = try await unconfirmedAttempt()
+        try await manager.pause(itemID("a"))
+        try await manager.resume(itemID("a"))
+        await manager.detach()
+        let session = FakeTransferSession(identifier: first.sessionIdentifier, liveTasks: [reference("a", generation: generation, task: 61)], deliversBacklogMarker: false)
+        let relaunched = try restart(first, session: session).makeManager()
+        try await relaunched.start()
+
+        let submissions = await session.submissions
+        let cancellations = await session.cancellations
+        let stored = await first.store.contents?.records.first
+        XCTAssertTrue(submissions.isEmpty)
+        XCTAssertTrue(cancellations.isEmpty)
+        XCTAssertEqual(stored?.binding?.taskIdentifier, 61)
+        XCTAssertEqual(stored?.phase, .queued)
+    }
+
+    // MARK: held policy on a stopped attempt
+
+    func testDeferredResumeNeverAdoptsATaskUnderAnObsoletePolicy() async throws {
+        let (harness, manager, generation) = try await unconfirmedAttempt()
+        await harness.clock.advance(by: 5)
+        await eventually("unresolved") {
+            if case .unresolved = await manager.reconciliationStatus() { return true } else { return false }
+        }
+        try await manager.pause(itemID("a"))
+        try await manager.setPolicy(.anyNetwork, for: itemID("a"))
+        try await manager.resume(itemID("a"))
+
+        await harness.session.addSystemTask(reference("a", generation: generation, task: 77))
+        try await manager.flushPendingWork()
+
+        let cancellations = await harness.session.cancellations
+        let submissions = await harness.session.submissions
+        XCTAssertEqual(cancellations, [FakeTransferSession.Cancellation(taskIdentifier: 77, producingResumeData: true)], "the old task is cancelled, not adopted")
+        XCTAssertEqual(submissions.map(\.generation), [generation + 1])
+        XCTAssertEqual(submissions.first?.policy, .anyNetwork)
+    }
+
+    // MARK: session storage failure
+
+    func testUnavailableBacklogKeepsTheFenceClosedWithItsReason() async throws {
+        let (harness, manager, generation) = try await unconfirmedAttempt()
+        await harness.session.emit(payload: .backlogUnavailable)
+        let unresolved = ReconciliationStatus.unresolved(items: [itemID("a")], reason: .sessionStorageFailed)
+        await eventually("reported") { await manager.reconciliationStatus() == unresolved }
+
+        await assertThrows(.reconciliationUnresolved) { try await manager.flushPendingWork() }
+        await harness.clock.advance(by: 30)
+        let later = await manager.reconciliationStatus()
+        let early = await harness.session.submissions
+        XCTAssertEqual(later, unresolved, "the deadline does not hide the reason")
+        XCTAssertTrue(early.isEmpty, "an incomplete backlog proves nothing")
+
+        await harness.session.emit(payload: .backlogDelivered)
+        await eventually("marker applied") { await manager.reconciliationStatus() == .resolved }
+        let submissions = await harness.session.submissions
+        XCTAssertEqual(submissions.map(\.generation), [generation + 1])
+    }
+
+    // MARK: leases on replaced files
+
+    func testReplacedFileIsKeptUntilItsLeaseEnds() async throws {
+        let harness = try Harness()
+        let manager = harness.makeManager()
+        try await manager.start()
+        try await completeItem("a", manager: manager, harness: harness)
+        let old = RelativePath.media(generation: 1)
+        guard case .available(let lease) = try await manager.localFile(for: itemID("a")) else { return XCTFail("no lease") }
+
+        // The file changes size behind the package's back: corrupt, retried, replaced.
+        await harness.fileSystem.putFile(harness.url(old), size: 99)
+        let corrupt = try await manager.localFile(for: itemID("a"))
+        XCTAssertEqual(corrupt, .unavailable(.corrupt))
+        try await manager.retry(itemID("a"))
+        let latest = try await XCTUnwrapAsync(await harness.session.latestReference(for: itemID("a")))
+        let captured = path("staging/a-\(latest.generation)")
+        await harness.fileSystem.putFile(harness.url(captured), size: 10)
+        await manager.engine.ingest(.transfer(.finished(latest, captured: captured, bytes: 10, validators: nil)))
+        await settle(manager)
+
+        let state = await manager.state(for: itemID("a"))
+        let keptWhileLeased = await harness.fileSystem.hasFile(harness.url(old))
+        let intent = await harness.store.contents?.cleanupPaths ?? []
+        XCTAssertEqual(state, .completed(at: referenceDate))
+        XCTAssertTrue(keptWhileLeased, "the lease URL stays valid until the lease ends")
+        XCTAssertTrue(intent.contains(old), "the deletion intent stays persisted")
+
+        await manager.endAccess(lease)
+        let deleted = await harness.fileSystem.hasFile(harness.url(old))
+        let closed = await harness.store.contents?.cleanupPaths ?? []
+        XCTAssertFalse(deleted)
+        XCTAssertFalse(closed.contains(old))
+    }
 }

@@ -299,4 +299,115 @@ final class StateMachineOwnershipTests: XCTestCase {
         XCTAssertTrue(outcome.submissions.isEmpty, "the latest command was a pause")
         XCTAssertEqual(machine.phase("a"), .paused)
     }
+
+    // MARK: unresolved stops across a relaunch
+
+    /// The machine a relaunch builds from what `machine` committed.
+    private func relaunched(_ machine: DownloadStateMachine) -> DownloadStateMachine {
+        let contents = IndexContents(nextGeneration: machine.nextGeneration, records: Array(machine.records.values), cleanupPaths: Array(machine.cleanup))
+        return DownloadStateMachine(contents: contents, sessionIdentifier: "session", defaultPolicy: .default, retryPolicy: .default)
+    }
+
+    func testUnconfirmedStopIsPersistedWithThePauseAndRestoredAfterARelaunch() throws {
+        var (machine, generation) = try submittedUnbound()
+        let paused = try machine.handle(.pause(itemID("a")), now: referenceDate)
+        XCTAssertTrue(paused.changed.contains(itemID("a")))
+        XCTAssertEqual(machine.record("a")?.stoppedWhileUnconfirmed, true, "committed with the pause itself")
+
+        var next = relaunched(machine)
+        XCTAssertTrue(next.isStoppedAndUnconfirmed(try XCTUnwrap(next.record("a"))))
+        let resumed = try next.handle(.resume(itemID("a")), now: referenceDate)
+        XCTAssertTrue(resumed.submissions.isEmpty, "an early resume after the relaunch creates no replacement")
+        XCTAssertEqual(next.generation("a"), generation)
+        XCTAssertEqual(next.record("a")?.restartDeferred, true)
+
+        let captured = path("staging/buffered")
+        let outcome = next.send(.finished(reference("a", generation: generation), captured: captured, bytes: 10, validators: nil))
+        XCTAssertFalse(next.cleanup.contains(captured), "the buffered completion is captured, never discarded")
+        XCTAssertEqual(outcome.effects, [.finalize(itemID("a"), generation: generation, captured: captured)])
+        XCTAssertEqual(next.record("a")?.stoppedWhileUnconfirmed, false)
+        XCTAssertEqual(next.record("a")?.restartDeferred, false)
+    }
+
+    func testDeferredRetryIsPersistedAndStartsOnceWhenTheEndIsProvenAfterARelaunch() throws {
+        var (machine, generation) = try submittedUnbound()
+        _ = try machine.handle(.cancel(itemID("a")), now: referenceDate)
+        let retried = try machine.handle(.retry(itemID("a")), now: referenceDate)
+        XCTAssertTrue(retried.submissions.isEmpty)
+        XCTAssertEqual(machine.record("a")?.restartDeferred, true)
+
+        var next = relaunched(machine)
+        XCTAssertTrue(next.deferredRestarts.contains(itemID("a")))
+        let proven = next.handle(.orphanedIntent(itemID("a"), generation: generation), now: referenceDate, jitter: 0)
+        let again = next.handle(.orphanedIntent(itemID("a"), generation: generation), now: referenceDate, jitter: 0)
+        XCTAssertEqual(proven.submissions.map(\.generation), [generation + 1])
+        XCTAssertTrue(again.submissions.isEmpty)
+        XCTAssertEqual(next.record("a")?.stoppedWhileUnconfirmed, false)
+    }
+
+    func testRestoredStopWithoutARestartEnforcesTheStopOnTheFoundTask() throws {
+        var (machine, generation) = try submittedUnbound()
+        _ = try machine.handle(.pause(itemID("a")), now: referenceDate)
+        var next = relaunched(machine)
+
+        let outcome = next.handle(.taskBound(itemID("a"), generation: generation, taskIdentifier: 31), now: referenceDate, jitter: 0)
+
+        XCTAssertEqual(outcome.effects, [.cancelTask(itemID("a"), taskIdentifier: 31, producingResumeData: true)])
+        XCTAssertEqual(next.phase("a"), .paused)
+        XCTAssertEqual(next.record("a")?.stoppedWhileUnconfirmed, false)
+    }
+
+    // MARK: held policy changes on stopped attempts
+
+    private func assertFoundTaskIsReplacedUnderTheCurrentPolicy(_ machine: inout DownloadStateMachine, generation: UInt64, find: (inout DownloadStateMachine) -> DownloadStateMachine.Outcome, file: StaticString = #filePath, line: UInt = #line) {
+        let outcome = find(&machine)
+        XCTAssertEqual(outcome.cancellations, [.cancelTask(itemID("a"), taskIdentifier: 9, producingResumeData: true)], "the old task is never adopted", file: file, line: line)
+        XCTAssertEqual(outcome.submissions.map(\.generation), [generation + 1], file: file, line: line)
+        XCTAssertEqual(outcome.submissions.first?.policy, .anyNetwork, "the new attempt uses the current policy", file: file, line: line)
+        XCTAssertFalse(machine.deferredResubmissions.contains(itemID("a")), "the change is consumed", file: file, line: line)
+        XCTAssertFalse(machine.deferredRestarts.contains(itemID("a")), file: file, line: line)
+
+        // Consumed exactly once: later news about the old task changes nothing.
+        let late = machine.handle(.taskBound(itemID("a"), generation: generation, taskIdentifier: 9), now: referenceDate, jitter: 0)
+        XCTAssertTrue(late.submissions.isEmpty, file: file, line: line)
+    }
+
+    func testPolicyChangeWhileStoppedIsEnforcedWhenADeferredResumeFindsTheTask() throws {
+        for discovery in ["bound", "progress"] {
+            var (machine, generation) = try submittedUnbound()
+            _ = try machine.handle(.pause(itemID("a")), now: referenceDate)
+            _ = try machine.handle(.setPolicy(.anyNetwork, itemID("a")), now: referenceDate)
+            XCTAssertEqual(machine.record("a")?.policyChangeDeferred, true, "held and persisted while stopped")
+            _ = try machine.handle(.resume(itemID("a")), now: referenceDate)
+            assertFoundTaskIsReplacedUnderTheCurrentPolicy(&machine, generation: generation) { machine in
+                discovery == "bound"
+                    ? machine.handle(.taskBound(itemID("a"), generation: generation, taskIdentifier: 9), now: referenceDate, jitter: 0)
+                    : machine.send(.progress(reference("a", generation: generation, task: 9), bytesWritten: 4, expectedBytes: 10))
+            }
+        }
+    }
+
+    func testPolicyChangeBeforeTheStopIsEnforcedWhenADeferredRetryFindsTheTask() throws {
+        var (machine, generation) = try submittedUnbound()
+        _ = try machine.handle(.setPolicy(.anyNetwork, itemID("a")), now: referenceDate)
+        _ = try machine.handle(.cancel(itemID("a")), now: referenceDate)
+        _ = try machine.handle(.retry(itemID("a")), now: referenceDate)
+        // Across a relaunch as well.
+        var next = relaunched(machine)
+        assertFoundTaskIsReplacedUnderTheCurrentPolicy(&next, generation: generation) { machine in
+            machine.send(.waiting(reference("a", generation: generation, task: 9), .connectivity))
+        }
+    }
+
+    func testHeldPolicyChangeIsEnforcedWhenProgressRevealsAnUnconfirmedTask() throws {
+        var (machine, generation) = try submittedUnbound()
+        _ = try machine.handle(.setPolicy(.anyNetwork, itemID("a")), now: referenceDate)
+        XCTAssertTrue(machine.deferredResubmissions.contains(itemID("a")))
+
+        let outcome = machine.send(.progress(reference("a", generation: generation, task: 9), bytesWritten: 4, expectedBytes: 10))
+
+        XCTAssertEqual(outcome.cancellations, [.cancelTask(itemID("a"), taskIdentifier: 9, producingResumeData: true)])
+        XCTAssertEqual(outcome.submissions.map(\.policy), [.anyNetwork])
+        XCTAssertFalse(machine.deferredResubmissions.contains(itemID("a")))
+    }
 }

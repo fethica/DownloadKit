@@ -13,11 +13,19 @@ import SQLite3
 /// library (no third-party dependency).
 ///
 /// Contract, beyond ``DownloadIndexStore``:
-/// - Schema version 1 lives in its own table. Opening a database whose stored version is newer
-///   than ``IndexSchema/currentVersion`` throws ``DownloadError/unsupportedSchema(found:supported:)``
-///   before anything is written; a file that is not a database, a database without the version
-///   table, or a record that does not decode throws ``DownloadError/corruptIndex``. Neither case
-///   modifies, resets or recreates the file.
+/// - The schema version lives in its own table. An existing database is first inspected on a
+///   read-only connection, in one read transaction: a stored version newer than
+///   ``IndexSchema/currentVersion`` throws ``DownloadError/unsupportedSchema(found:supported:)``;
+///   a file that is not a database, a database without the version table, a populated index
+///   without its required globals, a record that does not decode, contradicts itself or its row,
+///   or whose generation is not below the stored counter throws ``DownloadError/corruptIndex``.
+///   Refusal writes nothing (no journal mode change, no schema creation). Only an empty database
+///   is treated as never written. A valid version 1 index is migrated to version 2 in one
+///   transaction (see ``IndexSchema``).
+/// - The database file and its `-wal`, `-shm` and `-journal` companions must not be symbolic
+///   links (checked with ``PathConfinement`` against their directory before opening); otherwise
+///   opening throws ``DownloadError/storageUnavailable``. `SQLITE_OPEN_NOFOLLOW` is not used: it
+///   refuses links anywhere in the path, and system container paths can begin with one.
 /// - Every change set is one `BEGIN IMMEDIATE` transaction: all of it or none of it. The
 ///   database runs in WAL mode with full synchronous commits, so a committed change survives
 ///   process exit and a torn write is rolled back on the next open.
@@ -57,9 +65,19 @@ public actor SQLiteIndexStore: DownloadIndexStore {
     public init(fileURL: URL, progressWriteInterval: TimeInterval = 1, clock: any DownloadClock = SystemClock()) throws {
         self.progressWriteInterval = max(0, progressWriteInterval)
         self.clock = clock
+        try Self.checkConfinement(of: fileURL)
         // Released, and so closed, if anything below throws.
-        let connection = Connection(try Self.openDatabase(at: fileURL))
-        try Self.prepareSchema(connection.handle)
+        let connection: Connection
+        if try Self.exists(fileURL) {
+            // An existing index is inspected read-only first: refusing it writes nothing, not
+            // even a journal mode change.
+            try Self.inspect(Connection(try Self.openDatabase(at: fileURL, flags: SQLITE_OPEN_READONLY)))
+            connection = Connection(try Self.openDatabase(at: fileURL, flags: SQLITE_OPEN_READWRITE))
+            try Self.prepareExisting(connection.handle)
+        } else {
+            connection = Connection(try Self.openDatabase(at: fileURL, flags: SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE))
+            try Self.prepareSchema(connection.handle)
+        }
         self.committed = try Self.readContents(connection.handle)
         self.connection = connection
     }
@@ -208,10 +226,32 @@ public actor SQLiteIndexStore: DownloadIndexStore {
 
     // MARK: Opening
 
-    private static func openDatabase(at url: URL) throws -> OpaquePointer {
+    /// The database and its companion files must lie in their directory without being a symbolic
+    /// link, so the store never opens or mutates another database through a link.
+    private static func checkConfinement(of fileURL: URL) throws {
+        let directory = fileURL.deletingLastPathComponent()
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let url = suffix.isEmpty ? fileURL : URL(fileURLWithPath: fileURL.path + suffix)
+            do {
+                _ = try PathConfinement.confined(url, within: directory)
+            } catch {
+                throw DownloadError.storageUnavailable
+            }
+        }
+    }
+
+    private static func exists(_ url: URL) throws -> Bool {
+        var status = stat()
+        guard lstat(url.path, &status) == 0 else {
+            if errno == ENOENT { return false }
+            throw DownloadError.storageUnavailable
+        }
+        return true
+    }
+
+    private static func openDatabase(at url: URL, flags: Int32) throws -> OpaquePointer {
         var handle: OpaquePointer?
-        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX
-        let code = sqlite3_open_v2(url.path, &handle, flags, nil)
+        let code = sqlite3_open_v2(url.path, &handle, flags | SQLITE_OPEN_NOMUTEX, nil)
         guard code == SQLITE_OK, let handle else {
             if let handle { sqlite3_close_v2(handle) }
             throw DownloadError.storageUnavailable
@@ -220,49 +260,100 @@ public actor SQLiteIndexStore: DownloadIndexStore {
         return handle
     }
 
-    /// Creates schema version 1 in an empty database, refuses anything else that is not a
-    /// version 1 index, then switches to WAL. Nothing is written before the version check.
-    private static func prepareSchema(_ database: OpaquePointer) throws {
+    /// Validates an existing database on a read-only connection, in one read transaction:
+    /// schema version, tables, required globals, every record and cleanup path. Throws without
+    /// writing anything when it is not a usable index.
+    private static func inspect(_ connection: Connection) throws {
+        let database = connection.handle
+        do {
+            try execute(database, "BEGIN")
+        } catch let failure as SQLiteFailure {
+            throw failure.loadError
+        }
+        defer { try? execute(database, "ROLLBACK") }
+        if try checkSchema(database) {
+            _ = try readContents(database)
+        }
+    }
+
+    /// Checks the tables and version. Returns false for a database without any table (an
+    /// empty file or a creation that never committed), which is created afresh.
+    private static func checkSchema(_ database: OpaquePointer) throws -> Bool {
         let tables: [String]
         do {
             tables = try strings(database, "SELECT name FROM sqlite_master WHERE type = 'table'")
         } catch let failure as SQLiteFailure {
             throw failure.loadError
         }
-        if tables.isEmpty {
-            do {
-                try execute(database, "PRAGMA journal_mode = WAL")
-                try execute(database, "BEGIN IMMEDIATE")
-                try execute(database, "CREATE TABLE dk_schema (version INTEGER NOT NULL)")
-                try execute(database, "INSERT INTO dk_schema (version) VALUES (\(IndexSchema.currentVersion))")
-                try execute(database, "CREATE TABLE dk_globals (key TEXT PRIMARY KEY NOT NULL, value BLOB) WITHOUT ROWID")
-                try execute(database, "CREATE TABLE dk_records (id TEXT PRIMARY KEY NOT NULL, generation INTEGER NOT NULL, journal TEXT NOT NULL, record BLOB NOT NULL) WITHOUT ROWID")
-                try execute(database, "CREATE TABLE dk_cleanup (path TEXT PRIMARY KEY NOT NULL) WITHOUT ROWID")
-                try execute(database, "COMMIT")
-            } catch {
-                try? execute(database, "ROLLBACK")
-                throw DownloadError.storageUnavailable
-            }
-        } else {
-            guard tables.contains("dk_schema") else { throw DownloadError.corruptIndex }
-            let versions: [Int64]
-            do {
-                versions = try integers(database, "SELECT version FROM dk_schema")
-            } catch let failure as SQLiteFailure {
-                throw failure.loadError
-            }
-            guard let version = versions.max().map(Int.init) else { throw DownloadError.corruptIndex }
-            guard version <= IndexSchema.currentVersion else {
-                throw DownloadError.unsupportedSchema(found: version, supported: IndexSchema.currentVersion)
-            }
-            guard version >= 1, tables.contains("dk_globals"), tables.contains("dk_records"), tables.contains("dk_cleanup") else {
-                throw DownloadError.corruptIndex
-            }
-            do {
-                try execute(database, "PRAGMA journal_mode = WAL")
-            } catch let failure as SQLiteFailure {
-                throw failure.loadError
-            }
+        if tables.isEmpty { return false }
+        guard tables.contains("dk_schema") else { throw DownloadError.corruptIndex }
+        let versions: [Int64]
+        do {
+            versions = try integers(database, "SELECT version FROM dk_schema")
+        } catch let failure as SQLiteFailure {
+            throw failure.loadError
+        }
+        guard let version = versions.max().map(Int.init) else { throw DownloadError.corruptIndex }
+        guard version <= IndexSchema.currentVersion else {
+            throw DownloadError.unsupportedSchema(found: version, supported: IndexSchema.currentVersion)
+        }
+        guard version >= 1, tables.contains("dk_globals"), tables.contains("dk_records"), tables.contains("dk_cleanup") else {
+            throw DownloadError.corruptIndex
+        }
+        return true
+    }
+
+    /// Opens a database that passed ``inspect(_:)``: creates the schema if it had no table,
+    /// migrates version 1 to the current version, then switches to WAL. The checks run again on
+    /// this connection, so nothing is written to a database that changed in between.
+    private static func prepareExisting(_ database: OpaquePointer) throws {
+        guard try checkSchema(database) else {
+            try prepareSchema(database)
+            return
+        }
+        let versions = (try? integers(database, "SELECT version FROM dk_schema")) ?? []
+        if let version = versions.max(), version < Int64(IndexSchema.currentVersion) {
+            try migrate(database)
+        }
+        do {
+            try execute(database, "PRAGMA journal_mode = WAL")
+            try execute(database, "PRAGMA synchronous = FULL")
+        } catch let failure as SQLiteFailure {
+            throw failure.loadError
+        }
+    }
+
+    /// Version 1 to 2: the tables are unchanged; records gained optional fields
+    /// (``IndexRecord/stoppedWhileUnconfirmed``, ``IndexRecord/restartDeferred``,
+    /// ``IndexRecord/policyChangeDeferred``) that version 1 never wrote and that decode as false.
+    /// The version is raised so a version 1 build refuses the index instead of dropping those
+    /// fields when it rewrites a record. Idempotent: one transaction, re-run if interrupted.
+    private static func migrate(_ database: OpaquePointer) throws {
+        do {
+            try execute(database, "BEGIN IMMEDIATE")
+            try execute(database, "DELETE FROM dk_schema")
+            try execute(database, "INSERT INTO dk_schema (version) VALUES (\(IndexSchema.currentVersion))")
+            try execute(database, "COMMIT")
+        } catch {
+            try? execute(database, "ROLLBACK")
+            throw DownloadError.storageUnavailable
+        }
+    }
+
+    /// Creates the current schema in a database without tables, then switches to WAL.
+    private static func prepareSchema(_ database: OpaquePointer) throws {
+        do {
+            try execute(database, "PRAGMA journal_mode = WAL")
+            try execute(database, "BEGIN IMMEDIATE")
+            try execute(database, "CREATE TABLE dk_schema (version INTEGER NOT NULL)")
+            try execute(database, "INSERT INTO dk_schema (version) VALUES (\(IndexSchema.currentVersion))")
+            try execute(database, "CREATE TABLE dk_globals (key TEXT PRIMARY KEY NOT NULL, value BLOB) WITHOUT ROWID")
+            try execute(database, "CREATE TABLE dk_records (id TEXT PRIMARY KEY NOT NULL, generation INTEGER NOT NULL, journal TEXT NOT NULL, record BLOB NOT NULL) WITHOUT ROWID")
+            try execute(database, "CREATE TABLE dk_cleanup (path TEXT PRIMARY KEY NOT NULL) WITHOUT ROWID")
+            try execute(database, "COMMIT")
+        } catch {
+            try? execute(database, "ROLLBACK")
+            throw DownloadError.storageUnavailable
         }
         do {
             try execute(database, "PRAGMA synchronous = FULL")
@@ -271,10 +362,15 @@ public actor SQLiteIndexStore: DownloadIndexStore {
         }
     }
 
+    /// Reads and validates the whole index. `nil` only for a never-written index: no
+    /// `next_generation`, no other global, no record and no cleanup path. Everything else must
+    /// be consistent: every record passes the validating initialiser, matches its row's id,
+    /// generation and journal, and has a generation below `next_generation`.
     private static func readContents(_ database: OpaquePointer) throws -> IndexContents? {
         do {
             var nextGeneration: UInt64?
             var defaultPolicy: NetworkPolicy?
+            var otherGlobals = 0
             let globals = try Statement(database, "SELECT key, value FROM dk_globals")
             while try globals.next() {
                 switch globals.text(0) {
@@ -285,17 +381,17 @@ public actor SQLiteIndexStore: DownloadIndexStore {
                     defaultPolicy = try decoder.decode(NetworkPolicy.self, from: data)
                 default:
                     // Unknown keys are kept as they are.
-                    break
+                    otherGlobals += 1
                 }
             }
-            guard let nextGeneration else { return nil }
 
             var records: [IndexRecord] = []
-            let rows = try Statement(database, "SELECT id, record FROM dk_records ORDER BY id")
+            let rows = try Statement(database, "SELECT id, generation, journal, record FROM dk_records ORDER BY id")
             while try rows.next() {
-                guard let id = rows.text(0), let data = rows.data(1) else { throw DownloadError.corruptIndex }
-                let record = try decoder.decode(IndexRecord.self, from: data)
-                guard record.id.rawValue == id else { throw DownloadError.corruptIndex }
+                guard let id = rows.text(0), let journal = rows.text(2), let data = rows.data(3) else { throw DownloadError.corruptIndex }
+                let record = try validated(try decoder.decode(IndexRecord.self, from: data))
+                guard record.id.rawValue == id, Int64(bitPattern: record.generation) == rows.int64(1),
+                      record.journal.rawValue == journal else { throw DownloadError.corruptIndex }
                 records.append(record)
             }
 
@@ -305,6 +401,13 @@ public actor SQLiteIndexStore: DownloadIndexStore {
                 guard let raw = paths.text(0) else { throw DownloadError.corruptIndex }
                 cleanup.append(try RelativePath(raw))
             }
+
+            guard let nextGeneration else {
+                // Never written, or damaged: only a completely empty index is fresh.
+                guard records.isEmpty, cleanup.isEmpty, defaultPolicy == nil, otherGlobals == 0 else { throw DownloadError.corruptIndex }
+                return nil
+            }
+            guard records.allSatisfy({ $0.generation < nextGeneration }) else { throw DownloadError.corruptIndex }
             return IndexContents(schemaVersion: IndexSchema.currentVersion, nextGeneration: nextGeneration, defaultPolicy: defaultPolicy, records: records, cleanupPaths: cleanup)
         } catch let failure as SQLiteFailure {
             throw failure.loadError
@@ -314,6 +417,22 @@ public actor SQLiteIndexStore: DownloadIndexStore {
         } catch {
             throw DownloadError.corruptIndex
         }
+    }
+
+    /// The record rebuilt through the public validating initialiser, so a decoded record whose
+    /// fields contradict each other is refused like any other damage.
+    private static func validated(_ record: IndexRecord) throws -> IndexRecord {
+        try IndexRecord(
+            id: record.id, request: record.request, metadata: record.metadata, policy: record.policy,
+            phase: record.phase, generation: record.generation, automaticRetryCount: record.automaticRetryCount,
+            retryAt: record.retryAt, binding: record.binding, stoppingBinding: record.stoppingBinding,
+            bytesWritten: record.bytesWritten, expectedBytes: record.expectedBytes, validators: record.validators,
+            integrity: record.integrity, journal: record.journal, stagingPath: record.stagingPath,
+            finalizationDestination: record.finalizationDestination, finalPath: record.finalPath,
+            resumeDataPath: record.resumeDataPath, stoppedWhileUnconfirmed: record.stoppedWhileUnconfirmed,
+            restartDeferred: record.restartDeferred, policyChangeDeferred: record.policyChangeDeferred,
+            createdAt: record.createdAt, updatedAt: record.updatedAt
+        )
     }
 
     // MARK: Helpers

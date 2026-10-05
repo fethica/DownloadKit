@@ -47,12 +47,17 @@ public protocol TransferSession: Sendable {
     ///   never dropped. An event that was not acknowledged with ``acknowledge(through:)``
     ///   before the process ended is delivered again after reconnection, so a captured file
     ///   never loses its association with its task.
+    /// - A terminal event is delivered only after the session stored it durably. When storing
+    ///   fails it is kept (with any file it captured) and delivered later, in order; it is never
+    ///   delivered from memory alone and never silently lost.
     /// - Progress and waiting events are advisory: they may be coalesced or dropped.
     /// - ``TransferSessionEvent/Payload/backlogDelivered`` is the reconciliation fence: sent
     ///   once per session object, after every event that was pending when the session was
     ///   created or reconnected, covering both the adapter's durable inbox of captured files
     ///   and every system callback queued before it. A task list snapshot alone is not that
-    ///   proof. Until the fence (or a wake's drain marker) arrives, the manager never decides
+    ///   proof. A session that cannot read or store that backlog withholds the fence and sends
+    ///   ``TransferSessionEvent/Payload/backlogUnavailable`` instead. Until the fence (or a
+    ///   wake's drain marker) arrives, the manager never decides
     ///   that an expected task is gone; after ``DownloadConfiguration/reconciliationTimeout``
     ///   it reports ``ReconciliationStatus/unresolved(items:reason:)`` and still creates no
     ///   replacement.

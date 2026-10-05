@@ -104,7 +104,10 @@ public final class DownloadManager: Sendable {
     /// write. A file deletion that keeps failing leaves the item `removing`, or its deletion
     /// intent queued in the index. When start-up reconciliation timed out, this also looks for
     /// the missing tasks again and throws ``DownloadError/reconciliationUnresolved`` while some
-    /// are still unaccounted for; their intent and bytes are kept.
+    /// are still unaccounted for; their intent and bytes are kept. When the session reported its
+    /// backlog unavailable (``ReconciliationUnresolvedReason/sessionStorageFailed``) it keeps
+    /// throwing ``DownloadError/reconciliationUnresolved`` until the session's backlog marker
+    /// arrives, because only that marker proves the backlog complete.
     public func flushPendingWork() async throws {
         try await engine.flushPendingWork()
     }

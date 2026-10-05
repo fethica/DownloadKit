@@ -7,10 +7,25 @@
 //  identifier gets a fresh session object over the same host, which replays every
 //  unacknowledged event with its original sequence number.
 //
+//  Storage failures: a terminal event is delivered only after it was written to the inbox
+//  under its sequence number. An event whose write (or whose sequence reservation) fails stays
+//  pending, in order, with its receipt kept on disk; it is retried with the same sequence
+//  number, and nothing after it is delivered meanwhile (advisory events are dropped). An inbox
+//  that cannot be read at start is never treated as empty. While anything is pending or the
+//  inbox is unread, the backlog marker is withheld and ``TransferSessionEvent/Payload/backlogUnavailable``
+//  is sent instead; the marker follows once storage recovered.
+//
 
 import Foundation
 
 actor TransferSessionHost {
+    /// A terminal event not yet durably stored, with the sequence number it was given.
+    private struct PendingEvent {
+        let event: TransferEvent
+        let receipt: UUID?
+        var sequence: UInt64?
+    }
+
     let identifier: String
     let storageRoot: URL
     private let inbox: TransferInbox
@@ -19,12 +34,24 @@ actor TransferSessionHost {
     private let channel: AsyncStream<DelegateCallback>.Continuation
     private let callbacks: AsyncStream<DelegateCallback>
     private let sessionNetworkAccess: NetworkPolicy
+    private let storageRetryDelay: UInt64
 
     private var consumer: Task<Void, Never>?
     private var subscriber: AsyncStream<TransferSessionEvent>.Continuation?
     private var subscription: UUID?
+    /// The sequence number of the last entry yielded to the current subscriber.
+    private var lastYielded: UInt64 = 0
+    private var unavailableReported = false
+    /// The backlog marker of this subscription, withheld while storage is incomplete.
+    private var owedMarker: UUID?
+    /// Whether the durable inbox was read completely.
+    private var loaded = false
     /// Stored terminal events not yet acknowledged, in sequence order.
     private var unacknowledged: [StoredEvent] = []
+    /// Terminal events whose write failed, in order; delivered once written.
+    private var pending: [PendingEvent] = []
+    private var retryTask: Task<Void, Never>?
+    private var retryAttempts = 0
     private var handledReceipts: Set<UUID> = []
     private var nextSequence: UInt64 = 1
     private var reservedSequence: UInt64 = 0
@@ -36,10 +63,11 @@ actor TransferSessionHost {
     private var replacements: [Int: Int] = [:]
     private var lastProgress: [Int: Int64] = [:]
 
-    init(identifier: String, storageRoot: URL, options: URLSessionTransport.Options) throws {
+    init(identifier: String, storageRoot: URL, options: URLSessionTransport.Options, storageRetryDelay: TimeInterval = 2) throws {
         self.identifier = identifier
         self.storageRoot = storageRoot
         self.sessionNetworkAccess = options.sessionNetworkAccess
+        self.storageRetryDelay = UInt64(max(0.001, storageRetryDelay) * 1_000_000_000)
         let inbox = TransferInbox(storageRoot: storageRoot, sessionIdentifier: identifier)
         try inbox.prepare()
         self.inbox = inbox
@@ -60,22 +88,7 @@ actor TransferSessionHost {
     /// delegate's callbacks in order.
     func start() {
         guard consumer == nil else { return }
-        let stored = inbox.storedEvents()
-        let highest = stored.last?.sequence ?? 0
-        nextSequence = max(inbox.readState().reservedSequence, highest) + 1
-        reservedSequence = nextSequence - 1
-        unacknowledged = stored
-        let known = Set(stored.compactMap(\.receipt))
-        for receipt in inbox.pendingReceipts() {
-            handledReceipts.insert(receipt.id)
-            if known.contains(receipt.id) {
-                // The event was stored before the receipt could be deleted.
-                inbox.removeReceipt(receipt.id)
-            } else if let event = receipt.event.event {
-                store(event, receipt: receipt.id)
-                inbox.removeReceipt(receipt.id)
-            }
-        }
+        loadInbox()
         let callbacks = self.callbacks
         consumer = Task { [weak self] in
             for await callback in callbacks {
@@ -85,28 +98,72 @@ actor TransferSessionHost {
         }
     }
 
+    /// Reads the inbox once. A failure leaves it unread (nothing is assumed) and is retried.
+    private func loadInbox() {
+        guard !loaded else { return }
+        let contents: TransferInbox.Contents
+        do {
+            contents = try inbox.load()
+        } catch {
+            scheduleStorageRetry()
+            return
+        }
+        loaded = true
+        let highest = contents.events.last?.sequence ?? 0
+        nextSequence = max(contents.state.reservedSequence, highest) + 1
+        reservedSequence = nextSequence - 1
+        unacknowledged = contents.events
+        // A subscriber that arrived while the inbox was unread has received nothing yet.
+        for stored in contents.events {
+            if let event = stored.event.event { yield(stored.sequence, .transfer(event)) }
+        }
+        let known = Set(contents.events.compactMap(\.receipt))
+        var leftovers: [PendingEvent] = []
+        for receipt in contents.receipts {
+            handledReceipts.insert(receipt.id)
+            if known.contains(receipt.id) {
+                // The event was stored before the receipt could be deleted.
+                inbox.removeReceipt(receipt.id)
+            } else if let event = receipt.event.event {
+                leftovers.append(PendingEvent(event: event, receipt: receipt.id, sequence: nil))
+            }
+        }
+        // Leftover receipts are older than anything received since.
+        pending = leftovers + pending
+        flushPending()
+    }
+
     // MARK: Subscription
 
     /// A new event stream for one manager: every unacknowledged event with its original
     /// sequence number, then live events, with the backlog marker once the system's task list was
-    /// read and every callback queued before that was forwarded.
+    /// read and every callback queued before that was forwarded (a barrier on the delegate
+    /// queue), and once every captured outcome is durably stored.
     func subscribe() -> AsyncStream<TransferSessionEvent> {
         subscriber?.finish()
         let (stream, continuation) = AsyncStream.makeStream(of: TransferSessionEvent.self)
         subscriber = continuation
         let token = UUID()
         subscription = token
-        for stored in unacknowledged {
-            guard let event = stored.event.event else { continue }
-            continuation.yield(TransferSessionEvent(sequence: stored.sequence, payload: .transfer(event)))
+        lastYielded = 0
+        unavailableReported = false
+        owedMarker = nil
+        if loaded {
+            for stored in unacknowledged {
+                guard let event = stored.event.event else { continue }
+                yield(stored.sequence, .transfer(event))
+            }
         }
         let session = self.session
         let queue = delegateQueue
         let channel = self.channel
         Task {
             _ = await Self.tasks(of: session)
-            queue.addOperation { channel.yield(.barrier(token)) }
+            // A barrier, not an ordinary operation: it runs only after every operation queued
+            // before it has finished, whatever their readiness or priority.
+            queue.addBarrierBlock { channel.yield(.barrier(token)) }
         }
+        retryStorage()
         return stream
     }
 
@@ -115,8 +172,8 @@ actor TransferSessionHost {
     func submit(_ submission: TransferSubmission) throws -> Int {
         var resumeData: Data?
         var resumeURL: URL?
-        if let path = submission.resumeDataPath {
-            let url = storageRoot.appendingPathComponent(path.rawValue, isDirectory: false)
+        if let path = submission.resumeDataPath,
+           let url = try? inbox.confined(storageRoot.appendingPathComponent(path.rawValue, isDirectory: false)) {
             resumeURL = url
             if let data = try? Data(contentsOf: url), Self.isUsableResumeData(data), allowsResumption(under: submission.policy) {
                 resumeData = data
@@ -152,7 +209,7 @@ actor TransferSessionHost {
         guard let data, !data.isEmpty else { return }
         let path = RelativePath.staging()
         do {
-            try data.write(to: storageRoot.appendingPathComponent(path.rawValue, isDirectory: false), options: .atomic)
+            try data.write(to: try inbox.confined(storageRoot.appendingPathComponent(path.rawValue, isDirectory: false)), options: .atomic)
         } catch {
             return
         }
@@ -167,10 +224,13 @@ actor TransferSessionHost {
         let released = unacknowledged.filter { $0.sequence <= sequence }
         unacknowledged.removeAll { $0.sequence <= sequence }
         for event in released { inbox.removeEvent(event.sequence) }
+        retryStorage()
     }
 
     /// Ends the system session; its delegate then finishes the event stream.
     func invalidate(cancellingTasks: Bool) {
+        retryTask?.cancel()
+        retryTask = nil
         if cancellingTasks {
             session.invalidateAndCancel()
         } else {
@@ -182,9 +242,44 @@ actor TransferSessionHost {
 
     var urlSession: URLSession { session }
     var unacknowledgedSequences: [UInt64] { unacknowledged.map(\.sequence) }
+    var pendingCount: Int { pending.count }
+    var isInboxLoaded: Bool { loaded }
+    nonisolated var callbackChannel: AsyncStream<DelegateCallback>.Continuation { channel }
+    nonisolated var callbackQueue: OperationQueue { delegateQueue }
 
     func inject(_ callback: DelegateCallback) {
         channel.yield(callback)
+    }
+
+    // MARK: Storage retry
+
+    /// Tries again to read an unread inbox and to store pending events.
+    func retryStorage() {
+        if !loaded {
+            loadInbox()
+        } else {
+            flushPending()
+        }
+    }
+
+    private func scheduleStorageRetry() {
+        guard retryTask == nil else { return }
+        // Bounded backoff: the base delay doubled per failure, at most 32 times the base.
+        let delay = storageRetryDelay << UInt64(min(retryAttempts, 5))
+        retryAttempts += 1
+        retryTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: delay)
+            } catch {
+                return
+            }
+            await self?.storageRetryFired()
+        }
+    }
+
+    private func storageRetryFired() {
+        retryTask = nil
+        retryStorage()
     }
 
     // MARK: Callbacks
@@ -197,13 +292,13 @@ actor TransferSessionHost {
             let step = max(65_536, expected > 0 ? expected / 100 : 0)
             if let last = lastProgress[taskIdentifier], written - last < step, written != expected { return }
             lastProgress[taskIdentifier] = written
-            emit(.transfer(.progress(reference, bytesWritten: written, expectedBytes: expected > 0 ? expected : nil)))
+            emitAdvisory(.transfer(.progress(reference, bytesWritten: written, expectedBytes: expected > 0 ? expected : nil)))
 
         case .waiting(let taskIdentifier, let description):
             guard let reference = TransferTaskReference(taskDescription: description, taskIdentifier: taskIdentifier) else { return }
-            emit(.transfer(.waiting(reference, .connectivity)))
+            emitAdvisory(.transfer(.waiting(reference, .connectivity)))
 
-        case .receipt(let receipt, let taskIdentifier):
+        case .receipt(let receipt, let taskIdentifier, _):
             reportedTasks.insert(taskIdentifier)
             submissions[taskIdentifier] = nil
             lastProgress[taskIdentifier] = nil
@@ -211,14 +306,16 @@ actor TransferSessionHost {
             if replacements[taskIdentifier] != nil {
                 // The task was replaced by a restart: its outcome belongs to nobody. A file it
                 // captured was never reported, so the adapter deletes it.
-                if case .finished(_, let captured, _, _) = event {
-                    try? FileManager.default.removeItem(at: storageRoot.appendingPathComponent(captured.rawValue, isDirectory: false))
+                if case .finished(_, let captured, _, _) = event,
+                   let url = try? inbox.confined(storageRoot.appendingPathComponent(captured.rawValue, isDirectory: false)) {
+                    try? FileManager.default.removeItem(at: url)
                 }
                 inbox.removeReceipt(receipt.id)
                 return
             }
+            // A receipt that could not be written is kept only in memory: the event must be
+            // stored before anything after it is delivered.
             deliver(event, receipt: receipt.id)
-            inbox.removeReceipt(receipt.id)
 
         case .restart(let taskIdentifier, let description):
             reportedTasks.insert(taskIdentifier)
@@ -235,7 +332,7 @@ actor TransferSessionHost {
 
         case .barrier(let token):
             guard token == subscription else { return }
-            emit(.backlogDelivered)
+            deliverMarker(token)
 
         case .invalidated:
             subscriber?.finish()
@@ -267,36 +364,79 @@ actor TransferSessionHost {
 
     // MARK: Emitting
 
-    /// Stores a terminal event, then delivers it.
+    /// Queues a terminal event behind any pending one, then stores and delivers in order.
     private func deliver(_ event: TransferEvent, receipt: UUID?) {
-        let sequence = store(event, receipt: receipt)
-        subscriber?.yield(TransferSessionEvent(sequence: sequence, payload: .transfer(event)))
+        pending.append(PendingEvent(event: event, receipt: receipt, sequence: nil))
+        flushPending()
     }
 
-    @discardableResult
-    private func store(_ event: TransferEvent, receipt: UUID?) -> UInt64 {
-        let sequence = allocateSequence()
-        if let stored = StoredTransferEvent(event) {
-            let entry = StoredEvent(sequence: sequence, receipt: receipt, event: stored)
-            // If the write fails the event is still delivered and kept in memory until acknowledged.
-            try? inbox.write(entry)
-            unacknowledged.append(entry)
+    /// Stores and delivers pending terminal events in order, stopping at the first failure.
+    /// A failed event keeps its sequence number for the retry, so no number is used twice.
+    private func flushPending() {
+        guard loaded else {
+            scheduleStorageRetry()
+            return
         }
-        return sequence
+        while let head = pending.first {
+            do {
+                let sequence = try head.sequence ?? allocateSequence()
+                pending[0].sequence = sequence
+                // Terminal events always have a stored form.
+                let entry = StoredEvent(sequence: sequence, receipt: head.receipt, event: StoredTransferEvent(head.event)!)
+                try inbox.write(entry)
+                unacknowledged.append(entry)
+                pending.removeFirst()
+                yield(sequence, .transfer(head.event))
+                if let receipt = head.receipt { inbox.removeReceipt(receipt) }
+            } catch {
+                scheduleStorageRetry()
+                return
+            }
+        }
+        retryTask?.cancel()
+        retryTask = nil
+        retryAttempts = 0
+        if let owed = owedMarker, owed == subscription {
+            owedMarker = nil
+            deliverMarker(owed)
+        }
     }
 
-    /// Delivers an advisory event or a marker; nothing is stored.
-    private func emit(_ payload: TransferSessionEvent.Payload) {
-        let sequence = allocateSequence()
+    /// The backlog marker, only when the inbox was read completely and nothing is pending.
+    /// Otherwise the subscriber is told once that the backlog is unavailable, and the marker
+    /// follows when storage recovered.
+    private func deliverMarker(_ token: UUID) {
+        if loaded, pending.isEmpty, let sequence = try? allocateSequence() {
+            yield(sequence, .backlogDelivered)
+            return
+        }
+        owedMarker = token
+        if !unavailableReported {
+            unavailableReported = true
+            // Not a new position in the stream: it repeats the last delivered sequence number.
+            subscriber?.yield(TransferSessionEvent(sequence: lastYielded, payload: .backlogUnavailable))
+        }
+        scheduleStorageRetry()
+    }
+
+    /// Delivers an advisory event; nothing is stored. Dropped while a terminal event is pending
+    /// (it would otherwise overtake it) or when no number can be reserved.
+    private func emitAdvisory(_ payload: TransferSessionEvent.Payload) {
+        guard loaded, pending.isEmpty, let sequence = try? allocateSequence() else { return }
+        yield(sequence, payload)
+    }
+
+    private func yield(_ sequence: UInt64, _ payload: TransferSessionEvent.Payload) {
         subscriber?.yield(TransferSessionEvent(sequence: sequence, payload: payload))
+        lastYielded = sequence
     }
 
     /// Sequence numbers are reserved on disk in blocks before use, so they are never reused,
-    /// even by events that are not stored.
-    private func allocateSequence() -> UInt64 {
+    /// even by events that are not stored. Throws when the reservation cannot be written.
+    private func allocateSequence() throws -> UInt64 {
         if nextSequence > reservedSequence {
             let reserved = nextSequence + 255
-            try? inbox.write(TransferInbox.State(reservedSequence: reserved))
+            try inbox.write(TransferInbox.State(reservedSequence: reserved))
             reservedSequence = reserved
         }
         defer { nextSequence += 1 }

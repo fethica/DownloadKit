@@ -17,8 +17,10 @@ import Foundation
 enum DelegateCallback: Sendable {
     case progress(taskIdentifier: Int, description: String?, written: Int64, expected: Int64)
     case waiting(taskIdentifier: Int, description: String?)
-    /// A terminal outcome decided inside `didFinishDownloadingTo`, already written as a receipt.
-    case receipt(CaptureReceipt, taskIdentifier: Int)
+    /// A terminal outcome decided inside `didFinishDownloadingTo`. `durable` is false when its
+    /// receipt could not be written; the session then has to store the event before anything
+    /// else is delivered.
+    case receipt(CaptureReceipt, taskIdentifier: Int, durable: Bool)
     /// The continuation of a resumed task cannot be trusted; start it again from zero.
     case restart(taskIdentifier: Int, description: String?)
     case completed(taskIdentifier: Int, description: String?, failure: TransferFailure?)
@@ -30,7 +32,7 @@ enum DelegateCallback: Sendable {
 /// Moves a finished download into `staging/` and records the outcome, synchronously.
 struct FileCapture: Sendable {
     enum Outcome: Sendable {
-        case receipt(CaptureReceipt)
+        case receipt(CaptureReceipt, durable: Bool)
         case restart
     }
 
@@ -41,9 +43,14 @@ struct FileCapture: Sendable {
 
     /// Runs inside `didFinishDownloadingTo`, before it returns: `location` is only valid until
     /// then. A rejected response leaves the temporary file to the system, which deletes it.
+    ///
+    /// For accepted media the receipt naming the staging file is written first; only then is
+    /// the file moved. A file in `staging/` therefore always has a durable association with its
+    /// item and attempt. When the receipt cannot be written nothing is moved and the attempt
+    /// ends with a storage failure: a capture is never claimed without its association.
     func capture(location: URL, response: URLResponse?, request: URLRequest?, reference: TransferTaskReference) -> Outcome {
         guard let http = response as? HTTPURLResponse else {
-            return .receipt(record(.failed(reference, .invalidResponse)))
+            return record(.failed(reference, .invalidResponse))
         }
         let size = ((try? FileManager.default.attributesOfItem(atPath: location.path))?[.size] as? NSNumber)?.int64Value ?? 0
         let evidence = ResponseEvidence(
@@ -58,26 +65,40 @@ struct FileCapture: Sendable {
         case .restart:
             return .restart
         case .fail(let failure):
-            return .receipt(record(.failed(reference, failure)))
+            return record(.failed(reference, failure))
         case .accept(let validators, let bytes):
             let stagingPath = RelativePath.staging()
+            let destination: URL
             do {
-                try FileManager.default.moveItem(at: location, to: storageRoot.appendingPathComponent(stagingPath.rawValue, isDirectory: false))
+                destination = try inbox.confined(storageRoot.appendingPathComponent(stagingPath.rawValue, isDirectory: false))
             } catch {
-                return .receipt(record(.failed(reference, .storage(DownloadFileSystemError(error).storageReason))))
+                return record(.failed(reference, .storage(DownloadFileSystemError(error).storageReason)))
             }
-            return .receipt(record(.finished(reference, captured: stagingPath, bytes: bytes, validators: validators)))
+            let finished = TransferEvent.finished(reference, captured: stagingPath, bytes: bytes, validators: validators)
+            // Terminal events always have a stored form.
+            let receipt = CaptureReceipt(id: UUID(), written: now(), event: StoredTransferEvent(finished)!)
+            do {
+                try inbox.write(receipt)
+            } catch {
+                return record(.failed(reference, .storage(DownloadFileSystemError(error).storageReason)))
+            }
+            do {
+                try FileManager.default.moveItem(at: location, to: destination)
+            } catch {
+                // Replace the receipt with the failure. If even that write fails, the stored
+                // receipt names a capture that does not exist, which finalisation rejects.
+                let failed = CaptureReceipt(id: receipt.id, written: receipt.written, event: StoredTransferEvent(.failed(reference, .storage(DownloadFileSystemError(error).storageReason)))!)
+                return .receipt(failed, durable: (try? inbox.write(failed)) != nil)
+            }
+            return .receipt(receipt, durable: true)
         }
     }
 
-    /// Writes the receipt before the callback returns. If the write itself fails the session
-    /// still sequences and stores the event as soon as it receives it.
-    private func record(_ event: TransferEvent) -> CaptureReceipt {
-        // Terminal events always have a stored form.
-        let stored = StoredTransferEvent(event)!
-        let receipt = CaptureReceipt(id: UUID(), written: now(), event: stored)
-        try? inbox.write(receipt)
-        return receipt
+    /// Writes the receipt of an outcome that moved no file. If the write fails the session
+    /// still has to store the event before it delivers anything else.
+    private func record(_ event: TransferEvent) -> Outcome {
+        let receipt = CaptureReceipt(id: UUID(), written: now(), event: StoredTransferEvent(event)!)
+        return .receipt(receipt, durable: (try? inbox.write(receipt)) != nil)
     }
 
     private static let inspectedHeaders = ["Content-Type", "Content-Length", "Content-Range", "ETag", "Last-Modified", "Retry-After", "Date"]
@@ -117,8 +138,8 @@ final class TransferDelegate: NSObject, URLSessionDownloadDelegate, Sendable {
             reference: reference
         )
         switch outcome {
-        case .receipt(let receipt):
-            channel.yield(.receipt(receipt, taskIdentifier: downloadTask.taskIdentifier))
+        case .receipt(let receipt, let durable):
+            channel.yield(.receipt(receipt, taskIdentifier: downloadTask.taskIdentifier, durable: durable))
         case .restart:
             channel.yield(.restart(taskIdentifier: downloadTask.taskIdentifier, description: downloadTask.taskDescription))
         }

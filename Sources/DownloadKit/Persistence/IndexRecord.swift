@@ -12,9 +12,17 @@ import Foundation
 /// and leaves it untouched. An unreadable index fails with ``DownloadError/corruptIndex``
 /// and is preserved. The package never resets, recreates or clears an index to recover from
 /// a read error, and never deletes unrecognised files as start-up cleanup.
+///
+/// A version is raised whenever a field is added that an older build would silently drop when
+/// it rewrites a record, so the older build refuses the index instead of losing that state.
+/// Versions:
+/// - 1: the first schema.
+/// - 2: records gained ``IndexRecord/stoppedWhileUnconfirmed``, ``IndexRecord/restartDeferred``
+///   and ``IndexRecord/policyChangeDeferred``. Version 1 data is read as is (those fields read
+///   as false, which is what a version 1 build knew) and stamped version 2 on its next write.
 public enum IndexSchema {
     /// The schema version this build reads and writes.
-    public static let currentVersion = 1
+    public static let currentVersion = 2
 }
 
 /// One persisted item in the index.
@@ -29,7 +37,9 @@ public enum IndexSchema {
 /// - bytes and validators: ``bytesWritten``, ``expectedBytes``, ``validators``,
 ///   ``resumeDataPath``;
 /// - finalisation: ``journal``, ``stagingPath``, ``finalizationDestination``, ``finalPath``,
-///   ``integrity``.
+///   ``integrity``;
+/// - unresolved attempt (schema 2): ``stoppedWhileUnconfirmed``, ``restartDeferred``,
+///   ``policyChangeDeferred``.
 ///
 /// Generations are allocated from one counter per index and never reused, so an event that
 /// carries an older generation can never match a removed, replaced or re-enqueued item.
@@ -38,7 +48,7 @@ public enum IndexSchema {
 /// are rejected. The source URL, including its query, is stored as given; see
 /// ``URLRefreshing`` for keeping signed query credentials out of the index.
 ///
-/// External stores rebuild records with ``init(id:request:metadata:policy:phase:generation:automaticRetryCount:retryAt:binding:stoppingBinding:bytesWritten:expectedBytes:validators:integrity:journal:stagingPath:finalizationDestination:finalPath:resumeDataPath:createdAt:updatedAt:)``
+/// External stores rebuild records with ``init(id:request:metadata:policy:phase:generation:automaticRetryCount:retryAt:binding:stoppingBinding:bytesWritten:expectedBytes:validators:integrity:journal:stagingPath:finalizationDestination:finalPath:resumeDataPath:stoppedWhileUnconfirmed:restartDeferred:policyChangeDeferred:createdAt:updatedAt:)``
 /// or store them as opaque `Codable` values.
 public struct IndexRecord: Hashable, Sendable, Codable {
     public internal(set) var id: DownloadID
@@ -69,6 +79,19 @@ public struct IndexRecord: Hashable, Sendable, Codable {
     /// Opaque, optional, version-sensitive resume data captured from a paused or cancelled
     /// transfer. Never the source of truth for the item.
     public internal(set) var resumeDataPath: RelativePath?
+    /// The current attempt was paused or cancelled before any binding confirmed its task: the
+    /// task may still run and its completion may still arrive. Kept until the attempt's
+    /// disposition is proven (its task found, its completion or failure received, or its end
+    /// proven by the session's backlog), so a restart cannot replace it, before or after a
+    /// relaunch.
+    public internal(set) var stoppedWhileUnconfirmed: Bool
+    /// A resume or retry was asked for while ``stoppedWhileUnconfirmed`` held. It is carried
+    /// out once the attempt's disposition is known.
+    public internal(set) var restartDeferred: Bool
+    /// A policy change arrived while the attempt was unconfirmed. It is enforced when the
+    /// attempt's task is found (the task is cancelled and the attempt restarted under the
+    /// current policy) or dropped when the attempt provably ended.
+    public internal(set) var policyChangeDeferred: Bool
     public internal(set) var createdAt: Date
     public internal(set) var updatedAt: Date
 
@@ -76,7 +99,8 @@ public struct IndexRecord: Hashable, Sendable, Codable {
     ///
     /// Throws ``DownloadError/invalidStoredRecord(_:)`` when the fields contradict each
     /// other: a binding newer than the record's generation, a completed record without a final
-    /// path, or a captured journal without a staging path.
+    /// path, a captured journal without a staging path, or a deferred restart without an
+    /// unconfirmed stop.
     public init(
         id: DownloadID,
         request: RequestIdentity,
@@ -97,19 +121,25 @@ public struct IndexRecord: Hashable, Sendable, Codable {
         finalizationDestination: RelativePath? = nil,
         finalPath: RelativePath?,
         resumeDataPath: RelativePath?,
+        stoppedWhileUnconfirmed: Bool = false,
+        restartDeferred: Bool = false,
+        policyChangeDeferred: Bool = false,
         createdAt: Date,
         updatedAt: Date
     ) throws {
         if let binding, binding.generation > generation { throw DownloadError.invalidStoredRecord(id) }
         if case .completed = phase, finalPath == nil { throw DownloadError.invalidStoredRecord(id) }
         if journal == .captured, stagingPath == nil { throw DownloadError.invalidStoredRecord(id) }
+        if restartDeferred, !stoppedWhileUnconfirmed { throw DownloadError.invalidStoredRecord(id) }
         self.init(
             unchecked: id, request: request, metadata: metadata, policy: policy, phase: phase,
             generation: generation, automaticRetryCount: max(0, automaticRetryCount), retryAt: retryAt,
             binding: binding, stoppingBinding: stoppingBinding, bytesWritten: max(0, bytesWritten),
             expectedBytes: expectedBytes, validators: validators, integrity: integrity, journal: journal,
             stagingPath: stagingPath, finalizationDestination: finalizationDestination, finalPath: finalPath,
-            resumeDataPath: resumeDataPath, createdAt: createdAt, updatedAt: updatedAt
+            resumeDataPath: resumeDataPath, stoppedWhileUnconfirmed: stoppedWhileUnconfirmed,
+            restartDeferred: restartDeferred, policyChangeDeferred: policyChangeDeferred,
+            createdAt: createdAt, updatedAt: updatedAt
         )
     }
 
@@ -133,6 +163,9 @@ public struct IndexRecord: Hashable, Sendable, Codable {
         finalizationDestination: RelativePath? = nil,
         finalPath: RelativePath?,
         resumeDataPath: RelativePath?,
+        stoppedWhileUnconfirmed: Bool = false,
+        restartDeferred: Bool = false,
+        policyChangeDeferred: Bool = false,
         createdAt: Date,
         updatedAt: Date
     ) {
@@ -155,8 +188,48 @@ public struct IndexRecord: Hashable, Sendable, Codable {
         self.finalizationDestination = finalizationDestination
         self.finalPath = finalPath
         self.resumeDataPath = resumeDataPath
+        self.stoppedWhileUnconfirmed = stoppedWhileUnconfirmed
+        self.restartDeferred = restartDeferred
+        self.policyChangeDeferred = policyChangeDeferred
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, request, metadata, policy, phase, generation, automaticRetryCount, retryAt, binding
+        case stoppingBinding, bytesWritten, expectedBytes, validators, integrity, journal, stagingPath
+        case finalizationDestination, finalPath, resumeDataPath, stoppedWhileUnconfirmed, restartDeferred
+        case policyChangeDeferred, createdAt, updatedAt
+    }
+
+    /// Decodes a record of any supported schema version; fields added in version 2 read as
+    /// false when absent.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(DownloadID.self, forKey: .id)
+        request = try container.decode(RequestIdentity.self, forKey: .request)
+        metadata = try container.decode(DownloadMetadata.self, forKey: .metadata)
+        policy = try container.decodeIfPresent(NetworkPolicy.self, forKey: .policy)
+        phase = try container.decode(RecordPhase.self, forKey: .phase)
+        generation = try container.decode(UInt64.self, forKey: .generation)
+        automaticRetryCount = try container.decode(Int.self, forKey: .automaticRetryCount)
+        retryAt = try container.decodeIfPresent(Date.self, forKey: .retryAt)
+        binding = try container.decodeIfPresent(TaskBinding.self, forKey: .binding)
+        stoppingBinding = try container.decodeIfPresent(TaskBinding.self, forKey: .stoppingBinding)
+        bytesWritten = try container.decode(Int64.self, forKey: .bytesWritten)
+        expectedBytes = try container.decodeIfPresent(Int64.self, forKey: .expectedBytes)
+        validators = try container.decodeIfPresent(ResponseValidators.self, forKey: .validators)
+        integrity = try container.decodeIfPresent(IntegrityRecord.self, forKey: .integrity)
+        journal = try container.decode(FinalizationJournal.self, forKey: .journal)
+        stagingPath = try container.decodeIfPresent(RelativePath.self, forKey: .stagingPath)
+        finalizationDestination = try container.decodeIfPresent(RelativePath.self, forKey: .finalizationDestination)
+        finalPath = try container.decodeIfPresent(RelativePath.self, forKey: .finalPath)
+        resumeDataPath = try container.decodeIfPresent(RelativePath.self, forKey: .resumeDataPath)
+        stoppedWhileUnconfirmed = try container.decodeIfPresent(Bool.self, forKey: .stoppedWhileUnconfirmed) ?? false
+        restartDeferred = try container.decodeIfPresent(Bool.self, forKey: .restartDeferred) ?? false
+        policyChangeDeferred = try container.decodeIfPresent(Bool.self, forKey: .policyChangeDeferred) ?? false
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
     }
 
     /// The content revision of the item.

@@ -85,7 +85,11 @@ actor DownloadEngine {
 
     private var tail: Task<Void, Never>?
     private var subscribers: [UUID: AsyncStream<[DownloadSnapshot]>.Continuation] = [:]
-    private var leases: [DownloadID: Set<UUID>] = [:]
+    /// Outstanding leases per item, each with the file it protects.
+    private var leases: [DownloadID: [UUID: RelativePath]] = [:]
+    /// Queued deletions held back because a lease still protects the file. Their persisted
+    /// intent stays; each is retried when the last lease on its path ends.
+    private var leaseHeldCleanup: Set<RelativePath> = []
     private var pendingRemovals: [DownloadID: PendingRemoval] = [:]
     /// Removals that could not finish yet (a failed deletion or write, or a running finaliser).
     private var unfinishedRemovals: Set<DownloadID> = []
@@ -273,7 +277,10 @@ actor DownloadEngine {
     ///    files inspected (only a verified absence makes an item missing). Captured records
     ///    are finalised again only after the startup replay was drained (step 5), so a replayed
     ///    completion is applied before a recovered result can change the capture.
-    /// 5. Awaiting records with no live task become orphan candidates. The fence stays open
+    /// 5. Awaiting records with no live task become orphan candidates, and so do records
+    ///    restored as stopped while unconfirmed (``IndexRecord/stoppedWhileUnconfirmed``): a
+    ///    restart asked for before or after the relaunch stays deferred until the backlog proves
+    ///    the old attempt gone, so a buffered completion is captured, never discarded. The fence stays open
     ///    until the session reports its backlog delivered (or a wake's events finished), so a
     ///    completion buffered before start is applied first; only then are candidates
     ///    resubmitted. A candidate paused or cancelled meanwhile stays a candidate: a stop does
@@ -296,8 +303,11 @@ actor DownloadEngine {
                 continue
             }
             let key = AttemptKey(id: reference.itemID, generation: reference.generation)
+            // A restored stop that was never confirmed is resolved by the state machine: the
+            // task is adopted by a deferred restart or the stop is enforced on exactly it.
+            let stoppedUnconfirmed = record.generation == reference.generation && (machine?.isStoppedAndUnconfirmed(record) ?? false)
             let wanted = record.generation == reference.generation
-                && record.phase.isAwaitingTransfer
+                && (record.phase.isAwaitingTransfer || stoppedUnconfirmed)
                 && record.journal != .captured
                 && !adopted.contains(key)
             if wanted {
@@ -348,7 +358,8 @@ actor DownloadEngine {
                     recoveredFinalizations[AttemptKey(id: record.id, generation: record.generation)] = captured
                 }
             default:
-                guard record.phase.isAwaitingTransfer, record.journal != .captured else { continue }
+                let stoppedUnconfirmed = machine?.isStoppedAndUnconfirmed(record) ?? false
+                guard record.phase.isAwaitingTransfer || stoppedUnconfirmed, record.journal != .captured else { continue }
                 if !adopted.contains(AttemptKey(id: record.id, generation: record.generation)) {
                     orphanCandidates[record.id] = record.generation
                 }
@@ -636,9 +647,10 @@ actor DownloadEngine {
     private func runFlush() async throws {
         try requireRunning()
         if !retained.isEmpty || inboxBlocked { throw DownloadError.persistenceFailed }
-        if case .unresolved = fence {
+        if case .unresolved(let reason) = fence {
             await adoptLiveCandidates()
-            guard orphanCandidates.isEmpty else { throw DownloadError.reconciliationUnresolved }
+            // A session that could not deliver its backlog is resolved only by its marker.
+            guard orphanCandidates.isEmpty, reason != .sessionStorageFailed else { throw DownloadError.reconciliationUnresolved }
             markFence(.resolved)
         }
     }
@@ -717,6 +729,16 @@ actor DownloadEngine {
             return committed || (!event.isTerminal && lifecycle == .running)
         case .backlogDelivered:
             return await resolveFence()
+        case .backlogUnavailable:
+            // The session's backlog may be incomplete: nothing is concluded, the fence stays
+            // closed to replacement and reports why. Found tasks are still adopted, and
+            // recovered finalisations start (one capture per attempt makes that safe).
+            if isFenceOpen() {
+                markFence(.unresolved(.sessionStorageFailed))
+                await adoptLiveCandidates()
+                await startRecoveredFinalizations()
+            }
+            return true
         case .backgroundEventsFinished:
             // The system delivered every event of the wake: also a drain boundary.
             guard await resolveFence() else { return false }
@@ -998,10 +1020,18 @@ actor DownloadEngine {
     var finalizationsInFlight: Int { finalizations.count + recoveredFinalizations.count + finalizationResultsPending }
 
     /// Deletes a file whose deletion intent is persisted, and closes the intent only after the
-    /// deletion was verified. A file some record owns again is kept (ownership wins). A failed
+    /// deletion was verified. A file some record owns again is kept (ownership wins). A file an
+    /// outstanding lease protects is kept until that lease ends. A failed
     /// deletion, inspection or write keeps the intent and is retried at the next step.
     private func discard(_ path: RelativePath) async {
         guard let layout, let machine, machine.cleanup.contains(path) else { return }
+        if isLeased(path) {
+            // A lease promises its URL until it ends: the intent stays and the deletion runs
+            // when the last lease on this path ends (or at the next owner's start).
+            leaseHeldCleanup.insert(path)
+            failedCleanup.remove(path)
+            return
+        }
         if !machine.isOwned(path) {
             let url = layout.url(for: path)
             do {
@@ -1022,11 +1052,15 @@ actor DownloadEngine {
         }
     }
 
+    private func isLeased(_ path: RelativePath) -> Bool {
+        leases.values.contains { $0.values.contains(path) }
+    }
+
     /// Deletes a tombstoned item's files once no lease protects them and no finaliser of the
     /// item can still create one. The pending removal is kept until the record's deletion is
     /// committed; a failed file deletion or index write is retried at the next step.
     private func completeRemovalIfUnleased(_ id: DownloadID) async {
-        guard lifecycle == .running, leases[id, default: []].isEmpty, let pending = pendingRemovals[id], let layout else { return }
+        guard lifecycle == .running, leases[id, default: [:]].isEmpty, let pending = pendingRemovals[id], let layout else { return }
         guard !finalizations.keys.contains(where: { $0.id == id }) else {
             // Retried at the step that applies the finaliser's result.
             unfinishedRemovals.insert(id)
@@ -1093,7 +1127,7 @@ actor DownloadEngine {
                 }
             }
             let token = UUID()
-            leases[id, default: []].insert(token)
+            leases[id, default: [:]][token] = finalPath
             return .available(LocalFileLease(id: id, url: url, token: token, owner: self))
         case .removing:
             return .unavailable(.removing)
@@ -1112,7 +1146,7 @@ actor DownloadEngine {
     }
 
     private func runEndAccess(_ lease: LocalFileLease) async {
-        guard leases[lease.id]?.remove(lease.token) != nil else { return }
+        guard let released = leases[lease.id]?.removeValue(forKey: lease.token) else { return }
         if leases[lease.id]?.isEmpty == true { leases[lease.id] = nil }
         if lifecycle == .running, host == nil {
             // The manager was released while this lease kept its engine alive: stop owning
@@ -1122,6 +1156,10 @@ actor DownloadEngine {
         }
         switch lifecycle {
         case .running:
+            if leaseHeldCleanup.contains(released), !isLeased(released) {
+                leaseHeldCleanup.remove(released)
+                await discard(released)
+            }
             await completeRemovalIfUnleased(lease.id)
         case .detached:
             // A detached owner never deletes: the next owner finishes removals on its start.

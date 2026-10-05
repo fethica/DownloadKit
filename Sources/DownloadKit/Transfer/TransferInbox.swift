@@ -12,9 +12,16 @@
 //  - `state.json`: the highest reserved sequence number, so numbers are never reused across
 //    launches.
 //
-//  Crash windows: a receipt without an event becomes an event on the next start; a receipt
-//  whose event exists (the process ended between writing the event and deleting the receipt)
-//  is only deleted. No URL, header or credential is ever written here.
+//  Order inside the callback: the receipt (naming the staging file the capture will use) is
+//  written before the temporary file is moved, so a moved file always has a durable association.
+//  If the receipt cannot be written nothing is moved and the attempt is reported as a storage
+//  failure. A receipt is deleted only after its sequenced event was written.
+//
+//  Crash windows: a receipt without an event becomes an event on the next start (a receipt
+//  whose file was never moved then names a missing capture, which finalisation rejects); a
+//  receipt whose event exists (the process ended between writing the event and deleting the
+//  receipt) is only deleted. No URL, header or credential is written here; resume data is
+//  stored by the session as the opaque blob the system produced.
 //
 
 import Foundation
@@ -131,12 +138,33 @@ struct StoredEvent: Codable, Hashable, Sendable {
     let event: StoredTransferEvent
 }
 
-/// The files of one session's inbox. Every operation is synchronous and small.
+/// The files of one session's inbox. Every operation is synchronous and small, and every path is
+/// checked with ``PathConfinement`` against the storage root before it is used.
+///
+/// Failure rule: nothing here turns a failure into absence. A directory or entry that cannot be
+/// read, or an entry that does not decode into a complete event, makes ``load()`` throw; the
+/// session then reports its backlog unavailable instead of an empty one. Writes throw, and the
+/// session keeps the event (and its receipt) until a write succeeds.
 struct TransferInbox: Sendable {
     struct State: Codable, Hashable, Sendable {
         var reservedSequence: UInt64
     }
 
+    /// Everything the inbox holds.
+    struct Contents: Sendable {
+        /// Stored events, in sequence order.
+        var events: [StoredEvent]
+        /// Receipts, oldest first.
+        var receipts: [CaptureReceipt]
+        var state: State
+    }
+
+    /// An entry that exists but does not describe an event.
+    struct UnreadableEntry: Error {
+        let name: String
+    }
+
+    let storageRoot: URL
     let directory: URL
 
     init(storageRoot: URL, sessionIdentifier: String) {
@@ -146,6 +174,7 @@ struct TransferInbox: Sendable {
             default: return "_"
             }
         })
+        self.storageRoot = storageRoot
         directory = storageRoot
             .appendingPathComponent(Self.directoryName, isDirectory: true)
             .appendingPathComponent(name.isEmpty || name.hasPrefix(".") ? "_\(name)" : name, isDirectory: true)
@@ -157,52 +186,78 @@ struct TransferInbox: Sendable {
     var events: URL { directory.appendingPathComponent("events", isDirectory: true) }
     var stateFile: URL { directory.appendingPathComponent("state.json", isDirectory: false) }
 
+    /// `url`, refused when it leaves the storage root or goes through a symbolic link.
+    func confined(_ url: URL) throws -> URL {
+        try PathConfinement.confined(url, within: storageRoot)
+    }
+
     func prepare() throws {
-        try FileManager.default.createDirectory(at: receipts, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: events, withIntermediateDirectories: true)
-        var parent = directory.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: try confined(receipts), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: try confined(events), withIntermediateDirectories: true)
+        var parent = try confined(directory.deletingLastPathComponent())
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
-        try? parent.setResourceValues(values)
+        try parent.setResourceValues(values)
+    }
+
+    // MARK: Loading
+
+    /// Reads every stored event, receipt and the reservation state. Throws when any of them
+    /// cannot be read or decoded; never reports a partial inbox as complete.
+    func load() throws -> Contents {
+        let state = try readState()
+        let stored: [StoredEvent] = try entries(in: events)
+        for entry in stored where entry.event.event == nil { throw UnreadableEntry(name: "event \(entry.sequence)") }
+        let pending: [CaptureReceipt] = try entries(in: receipts)
+        for receipt in pending where receipt.event.event == nil { throw UnreadableEntry(name: "receipt \(receipt.id)") }
+        return Contents(
+            events: stored.sorted { $0.sequence < $1.sequence },
+            receipts: pending.sorted { ($0.written, $0.id.uuidString) < ($1.written, $1.id.uuidString) },
+            state: state
+        )
+    }
+
+    private func entries<T: Decodable>(in directory: URL) throws -> [T] {
+        let folder = try confined(directory)
+        let names = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+        return try names.filter { $0.hasSuffix(".json") && !$0.hasPrefix(".") }.sorted().map { name in
+            let data = try Data(contentsOf: try confined(folder.appendingPathComponent(name, isDirectory: false)))
+            do {
+                return try Self.decoder.decode(T.self, from: data)
+            } catch {
+                throw UnreadableEntry(name: name)
+            }
+        }
     }
 
     // MARK: Receipts
 
     func write(_ receipt: CaptureReceipt) throws {
-        let url = receipts.appendingPathComponent("\(receipt.id.uuidString.lowercased()).json", isDirectory: false)
-        try Self.encoder.encode(receipt).write(to: url, options: .atomic)
+        try Self.encoder.encode(receipt).write(to: try confined(receiptURL(receipt.id)), options: .atomic)
     }
 
-    /// Receipts on disk, oldest first. Files that do not decode are left alone.
-    func pendingReceipts() -> [CaptureReceipt] {
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: receipts.path)) ?? []
-        return names.filter { $0.hasSuffix(".json") }.compactMap { name in
-            guard let data = try? Data(contentsOf: receipts.appendingPathComponent(name)) else { return nil }
-            return try? Self.decoder.decode(CaptureReceipt.self, from: data)
-        }.sorted { ($0.written, $0.id.uuidString) < ($1.written, $1.id.uuidString) }
-    }
-
+    /// Deletes a receipt whose event is stored. Best effort: a leftover receipt whose event
+    /// exists is only deleted on the next start.
     func removeReceipt(_ id: UUID) {
-        try? FileManager.default.removeItem(at: receipts.appendingPathComponent("\(id.uuidString.lowercased()).json", isDirectory: false))
+        guard let url = try? confined(receiptURL(id)) else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private func receiptURL(_ id: UUID) -> URL {
+        receipts.appendingPathComponent("\(id.uuidString.lowercased()).json", isDirectory: false)
     }
 
     // MARK: Events
 
     func write(_ event: StoredEvent) throws {
-        try Self.encoder.encode(event).write(to: url(forSequence: event.sequence), options: .atomic)
+        try Self.encoder.encode(event).write(to: try confined(url(forSequence: event.sequence)), options: .atomic)
     }
 
-    /// Stored events, in sequence order. Files that do not decode are left alone.
-    func storedEvents() -> [StoredEvent] {
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: events.path)) ?? []
-        return names.filter { $0.hasSuffix(".json") }.compactMap { name in
-            guard let data = try? Data(contentsOf: events.appendingPathComponent(name)) else { return nil }
-            return try? Self.decoder.decode(StoredEvent.self, from: data)
-        }.sorted { $0.sequence < $1.sequence }
-    }
-
+    /// Deletes an acknowledged event. Best effort: a leftover is delivered again after a
+    /// relaunch, and the manager applies a replay idempotently.
     func removeEvent(_ sequence: UInt64) {
-        try? FileManager.default.removeItem(at: url(forSequence: sequence))
+        guard let url = try? confined(url(forSequence: sequence)) else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     private func url(forSequence sequence: UInt64) -> URL {
@@ -212,15 +267,25 @@ struct TransferInbox: Sendable {
 
     // MARK: State
 
-    func readState() -> State {
-        guard let data = try? Data(contentsOf: stateFile), let state = try? Self.decoder.decode(State.self, from: data) else {
-            return State(reservedSequence: 0)
+    /// The reservation state. Only a verified absence (never written) reads as zero.
+    func readState() throws -> State {
+        let url = try confined(stateFile)
+        var status = stat()
+        if lstat(url.path, &status) != 0 {
+            let code = errno
+            if code == ENOENT { return State(reservedSequence: 0) }
+            throw DownloadFileSystemError(posixCode: code)
         }
-        return state
+        let data = try Data(contentsOf: url)
+        do {
+            return try Self.decoder.decode(State.self, from: data)
+        } catch {
+            throw UnreadableEntry(name: "state.json")
+        }
     }
 
     func write(_ state: State) throws {
-        try Self.encoder.encode(state).write(to: stateFile, options: .atomic)
+        try Self.encoder.encode(state).write(to: try confined(stateFile), options: .atomic)
     }
 
     private static let encoder: JSONEncoder = {
