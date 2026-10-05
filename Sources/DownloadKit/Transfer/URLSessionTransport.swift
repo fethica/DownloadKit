@@ -206,11 +206,16 @@ actor TransferHostRegistry {
     }
 
     func invalidateAll(cancellingTasks: Bool) async {
-        for (identifier, host) in hosts {
-            await host.invalidate(cancellingTasks: cancellingTasks)
-            invalidated.insert(identifier)
-        }
+        // Claim every host before the first suspension: the actor is reentrant, so a host
+        // created for a new identifier while an older one is still being invalidated is not
+        // part of this operation and must survive it, and a lookup of a claimed identifier
+        // is refused from this point on rather than after its invalidation finishes.
+        let claimed = hosts
         hosts = [:]
+        invalidated.formUnion(claimed.keys)
+        for host in claimed.values {
+            await host.invalidate(cancellingTasks: cancellingTasks)
+        }
     }
 }
 

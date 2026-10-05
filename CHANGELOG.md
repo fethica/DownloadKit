@@ -4,6 +4,9 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- `TransferHostRegistry.invalidateAll` claims its hosts before its first suspension: a session host created for a new identifier while an older one is being invalidated survives, and a claimed identifier is refused at once (the registry is a reentrant actor).
+- `DownloadListModel` fences network-policy reads against writes: a policy read begun before `setDefaultPolicy` cannot overwrite the written value when it lands afterwards.
+- Comments: the content hasher runs off every actor on the concurrent executor; the SQLite `SQLITE_TRANSIENT` sentinel is explained; `any CVarArg` spelled out.
 - `DownloadListModel` supersedes a playback lookup still in flight when its item is removed, whether through a confirmed removal or one observed from the manager: the late lease is ended instead of installed, so a removal never waits on a lease the user no longer wants.
 - The reconciliation deadline is published to snapshot subscribers at once, outside the serialized step chain, so a step suspended on the index or a host hook no longer delays the status.
 - The fixture server accepts only `HTTP/1.1` and `HTTP/1.0` request lines, header names made of token characters, and targets free of whitespace and control bytes; anything else is a 400.

@@ -126,7 +126,7 @@ public struct DownloadStrings: Sendable {
 
     /// The format string for `key` with `arguments` substituted (`%@` placeholders).
     public func text(_ key: DownloadStringKey, _ arguments: String...) -> String {
-        String(format: text(key), arguments: arguments.map { $0 as CVarArg })
+        String(format: text(key), arguments: arguments.map { $0 as any CVarArg })
     }
 
     // MARK: Composed strings

@@ -548,6 +548,10 @@ private final class Statement {
         sqlite3_finalize(handle)
     }
 
+    /// `SQLITE_TRANSIENT`: the C macro is not imported, so the sentinel is spelled out. It is
+    /// not a function pointer SQLite calls; it tells SQLite to copy the bound bytes before the
+    /// call returns, which is what lets a Swift String or a scoped buffer be bound safely.
+    /// A null destructor would make SQLite keep pointing at storage Swift has already freed.
     private static var transient: sqlite3_destructor_type {
         unsafeBitCast(-1, to: sqlite3_destructor_type.self)
     }

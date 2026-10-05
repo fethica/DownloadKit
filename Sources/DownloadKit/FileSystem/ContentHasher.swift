@@ -14,8 +14,9 @@ enum ContentHasher {
     static let chunkSize = 256 * 1024
 
     /// The lowercase hexadecimal SHA-256 of the file at `url`, or `nil` when `shouldContinue`
-    /// returned false before a chunk (a deadline or a cancellation). Runs on the caller's
-    /// executor, never the main actor unless called from it.
+    /// returned false before a chunk (a deadline or a cancellation). A nonisolated async
+    /// function: it runs off every actor, on the concurrent executor, so a caller on the
+    /// main actor or on an engine is never blocked by the reads.
     static func sha256(
         of url: URL,
         fileSystem: any DownloadFileSystem,

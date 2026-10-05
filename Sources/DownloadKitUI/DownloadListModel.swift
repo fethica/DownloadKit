@@ -71,6 +71,9 @@ public final class DownloadListModel: ObservableObject {
     /// Advanced by every playback request and stop; a lookup that finishes under an older
     /// value is obsolete and its lease is ended at once.
     private var playbackToken: UInt64 = 0
+    /// Advances whenever a policy write starts, so a policy read begun before the write cannot
+    /// overwrite the written value when its continuation lands afterwards.
+    private(set) var policyRevision: UInt64 = 0
     /// The playback lookup in flight (item and request token), so that the removal of its
     /// item can supersede it.
     private var pendingPlayback: (id: DownloadID, token: UInt64)?
@@ -115,8 +118,9 @@ public final class DownloadListModel: ObservableObject {
             for try await list in sequence {
                 if Task.isCancelled { break }
                 let status = await controller.reconciliationStatus()
+                let revision = await model.policyRevision
                 let policy = await controller.defaultPolicy()
-                await model.receive(list, status: status, policy: policy)
+                await model.receive(list, status: status, policy: policy, policyRevision: revision)
             }
         } catch {
             // A throwing sequence ended; the subscription is over either way.
@@ -130,10 +134,10 @@ public final class DownloadListModel: ObservableObject {
         if items != self.items { self.items = items }
     }
 
-    func receive(_ snapshots: [DownloadSnapshot], status: ReconciliationStatus, policy: NetworkPolicy? = nil) {
+    func receive(_ snapshots: [DownloadSnapshot], status: ReconciliationStatus, policy: NetworkPolicy? = nil, policyRevision: UInt64? = nil) {
         apply(snapshots)
         updateBanner(DownloadBanner(status: status))
-        if let policy, policy != defaultPolicy { defaultPolicy = policy }
+        if let policy, policyRevision ?? self.policyRevision == self.policyRevision, policy != defaultPolicy { defaultPolicy = policy }
         endPlaybackIfRemoved(by: snapshots)
     }
 
@@ -255,7 +259,10 @@ public final class DownloadListModel: ObservableObject {
 
     public func refreshDefaultPolicy() async {
         guard let controller else { return }
+        let revision = policyRevision
         let policy = await controller.defaultPolicy()
+        // A write that started meanwhile owns the value; this read is stale.
+        guard revision == policyRevision else { return }
         if policy != defaultPolicy { defaultPolicy = policy }
     }
 
@@ -266,6 +273,7 @@ public final class DownloadListModel: ObservableObject {
             return
         }
         let policy = choice.policy(scheduling: defaultPolicy?.scheduling ?? .userInitiated)
+        policyRevision &+= 1
         do {
             try await controller.setDefaultPolicy(policy)
             defaultPolicy = policy

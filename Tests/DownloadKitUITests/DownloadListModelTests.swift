@@ -68,6 +68,24 @@ final class DownloadListModelTests: XCTestCase {
         await task.value
     }
 
+    /// A policy read begun before a write may land after it; the write owns the value.
+    func testAStalePolicyReadCannotOverwriteANewerWrite() async throws {
+        let fake = FakeController()
+        let model = DownloadListModel(controller: fake)
+        await model.refreshDefaultPolicy()
+        let staleRevision = model.policyRevision
+        let stalePolicy = try XCTUnwrap(model.defaultPolicy)
+        await model.setDefaultPolicy(.unmeteredIncludingLowData)
+        let written = try XCTUnwrap(model.defaultPolicy)
+        XCTAssertNotEqual(written, stalePolicy)
+        // The pump's read that started before the write delivers now.
+        model.receive([], status: .resolved, policy: stalePolicy, policyRevision: staleRevision)
+        XCTAssertEqual(model.defaultPolicy, written, "a stale read must not overwrite the newer write")
+        // A read begun after the write is applied as usual.
+        model.receive([], status: .resolved, policy: stalePolicy, policyRevision: model.policyRevision)
+        XCTAssertEqual(model.defaultPolicy, stalePolicy)
+    }
+
     func testPolicySetOutsideTheModelIsPublished() async throws {
         let fake = FakeController()
         let model = DownloadListModel(controller: fake)
