@@ -362,6 +362,34 @@ final class DownloadManagerOwnershipTests: XCTestCase {
         reader.cancel()
     }
 
+    /// The deadline's status change reaches subscribers at once, even while an earlier step is
+    /// suspended on the index: the notification does not wait behind the chain.
+    func testFenceDeadlinePublishesWhileAnIndexWriteIsSuspended() async throws {
+        let (harness, manager, _) = try await unconfirmedAttempt()
+        let recorder = ListRecorder()
+        let stream = await manager.snapshots()
+        let reader = Task { for await list in stream { await recorder.append(list) } }
+        await eventually("current list") { await recorder.count == 1 }
+
+        await harness.store.setHoldWrites(true)
+        let blocked = Task { try await manager.enqueue(makeRequest("b")) }
+        await eventually("write suspended") { await harness.store.heldWriteCount == 1 }
+        await harness.clock.advance(by: 5)
+        await eventually("deadline recorded") {
+            await manager.reconciliationStatus() == .unresolved(items: [itemID("a")], reason: .deadlineExceeded)
+        }
+        await eventually("the deadline alone delivers a list while the write is held") { await recorder.count == 2 }
+        let lists = await recorder.lists
+        XCTAssertEqual(lists.count, 2)
+        if lists.count == 2 { XCTAssertEqual(lists[1], lists[0], "no record changed") }
+        let held = await harness.store.heldWriteCount
+        XCTAssertEqual(held, 1, "the notification did not wait for the write")
+
+        await harness.store.setHoldWrites(false)
+        _ = try await blocked.value
+        reader.cancel()
+    }
+
     func testWithheldBacklogMarkerLeavesIntentUnresolvedAtTheDeadline() async throws {
         let sessionIdentifier = Harness.uniqueName("session")
         var machine = DownloadStateMachine.fresh(session: sessionIdentifier)

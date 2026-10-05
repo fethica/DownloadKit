@@ -305,6 +305,46 @@ final class LocalFileLeaseTests: XCTestCase {
         try await assertRemovalFinishes([tone, chime])
     }
 
+    /// Removing the item whose playback lookup is still in flight supersedes that lookup, by
+    /// a confirmed removal and by one observed from the manager: the late lease is ended,
+    /// nothing is installed, and the removal finishes without a later Stop.
+    func testRemovalDuringPlaybackLookupRejectsTheLateLease() async throws {
+        for external in [false, true] {
+            let tone = try await downloadCompleted(external ? "tone-observed" : "tone-confirmed")
+            let gate = GatedController(manager)
+            let model = DownloadListModel(controller: gate)
+            let observation = Task { await model.observe() }
+            let listed = await eventually { model.snapshot(for: tone) != nil }
+            XCTAssertTrue(listed)
+            await gate.setHolding(true)
+
+            let play = Task { await model.beginPlayback(of: tone) }
+            await waitForHeld(gate, 1) // The manager has issued the lease; the model has not seen it.
+            if external {
+                try await manager.remove(tone)
+            } else {
+                model.requestRemoval(of: [tone], title: nil)
+                await model.confirmRemoval()
+            }
+            let removing = await eventually { model.snapshot(for: tone)?.state == .removing }
+            XCTAssertTrue(removing, "the removal waits on the lease the lookup produced")
+            XCTAssertNil(model.playbackLease)
+
+            await gate.release(0)
+            let late = await play.value
+            XCTAssertNil(late, "the removal supersedes the pending Play (\(external ? "observed" : "confirmed"))")
+            XCTAssertNil(model.playbackLease)
+            XCTAssertTrue(model.openLeases.isEmpty)
+            let manager = manager!
+            let gone = await eventually { await manager.state(for: tone) == .notDownloaded }
+            XCTAssertTrue(gone, "the removal finishes without a later Stop")
+
+            await model.endPlayback()
+            observation.cancel()
+            await observation.value
+        }
+    }
+
     /// Confirming the removal of the playing item ends the playback lease so the removal can
     /// finish; an unrelated removal leaves playback alone.
     func testRemovingThePlayingItemEndsItsPlaybackLease() async throws {

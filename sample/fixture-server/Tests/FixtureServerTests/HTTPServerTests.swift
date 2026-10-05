@@ -95,6 +95,22 @@ final class HTTPServerTests: XCTestCase {
         try assertServesAWellFormedRequest()
     }
 
+    func testMalformedVersionHeaderNameAndTargetAreRejected() throws {
+        let cases = [
+            "GET /files/tone-a.wav HTTP/1.\r\n\r\n",
+            "GET /files/tone-a.wav HTTP/1.1junk\r\n\r\n",
+            "GET /files/tone-a.wav HTTP/2\r\n\r\n",
+            "GET /files/tone-a.wav HTTP/1.1\r\nX(Bad): value\r\n\r\n",
+            "GET /files/tone-a.wav HTTP/1.1\r\nX\u{7F}Bad: value\r\n\r\n",
+            "GET /files/tone\u{01}a.wav HTTP/1.1\r\n\r\n",
+        ]
+        for request in cases {
+            let response = try exchange(Data(request.utf8))
+            XCTAssertEqual(status(of: response), "HTTP/1.1 400 Bad Request", request.debugDescription)
+            try assertServesAWellFormedRequest()
+        }
+    }
+
     func testTruncatedBodyIsRejected() throws {
         let response = try exchange(Data("POST /control/reset HTTP/1.1\r\nContent-Length: 20\r\n\r\nshort".utf8))
         XCTAssertEqual(status(of: response), "HTTP/1.1 400 Bad Request")

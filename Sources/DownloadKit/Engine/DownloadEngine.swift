@@ -398,6 +398,10 @@ actor DownloadEngine {
         fenceTimer = nil
         guard lifecycle == .running, case .open = fence else { return }
         fence = .unresolved(.deadlineExceeded)
+        // Subscribers learn of the status here, not behind the chain: a step suspended on the
+        // index or on a host hook would otherwise hold the notification as long as it holds
+        // the step. Nothing is concluded and no record changes, so the list is the same one.
+        await publishIfChanged()
         submitStep { [self] in await self.runFenceDeadline() }
     }
 

@@ -184,7 +184,8 @@ struct RequestHead: Equatable {
     var contentLength: Int
 
     /// Parses the bytes before the blank line. Rejects a request line that is not
-    /// `METHOD /target HTTP/x.y`, a header line without a name, and a `Content-Length` that is
+    /// `METHOD /target HTTP/1.1` (or `HTTP/1.0`) with a target free of whitespace and control
+    /// bytes, a header line whose name is empty or not a token, and a `Content-Length` that is
     /// not a decimal number within ``maxBodyLength`` (or that disagrees with a repeated one), and
     /// any `Transfer-Encoding`.
     static func parse(_ bytes: Data) -> Result<RequestHead, Failure> {
@@ -194,14 +195,15 @@ struct RequestHead: Equatable {
         guard requestLine.count == 3,
               !requestLine[0].isEmpty, requestLine[0].allSatisfy({ $0.isASCII && $0.isLetter }),
               requestLine[1].hasPrefix("/"),
-              requestLine[2].hasPrefix("HTTP/1.") else {
+              !requestLine[1].contains(where: { $0.isWhitespace || $0.asciiValue.map { $0 < 0x20 || $0 == 0x7F } ?? true }),
+              requestLine[2] == "HTTP/1.1" || requestLine[2] == "HTTP/1.0" else {
             return .failure(Failure(reason: "malformed request line"))
         }
         var headers: [String: String] = [:]
         var lengths: Set<String> = []
         for line in lines {
             guard let colon = line.firstIndex(of: ":"), colon != line.startIndex,
-                  !line[..<colon].contains(where: { $0 == " " || $0 == "\t" }) else {
+                  line[..<colon].allSatisfy(isHeaderNameCharacter) else {
                 return .failure(Failure(reason: "malformed header line"))
             }
             let name = String(line[..<colon]).lowercased()
@@ -220,6 +222,21 @@ struct RequestHead: Equatable {
             contentLength = parsed
         }
         return .success(RequestHead(method: String(requestLine[0]), target: String(requestLine[1]), headers: headers, contentLength: contentLength))
+    }
+}
+
+/// The `tchar` grammar of RFC 9110: a header name is one or more of these and nothing else.
+private func isHeaderNameCharacter(_ character: Character) -> Bool {
+    guard let value = character.asciiValue else { return false }
+    switch value {
+    case UInt8(ascii: "0")...UInt8(ascii: "9"), UInt8(ascii: "a")...UInt8(ascii: "z"), UInt8(ascii: "A")...UInt8(ascii: "Z"):
+        return true
+    case UInt8(ascii: "!"), UInt8(ascii: "#"), UInt8(ascii: "$"), UInt8(ascii: "%"), UInt8(ascii: "&"), UInt8(ascii: "'"),
+         UInt8(ascii: "*"), UInt8(ascii: "+"), UInt8(ascii: "-"), UInt8(ascii: "."), UInt8(ascii: "^"), UInt8(ascii: "_"),
+         UInt8(ascii: "`"), UInt8(ascii: "|"), UInt8(ascii: "~"):
+        return true
+    default:
+        return false
     }
 }
 

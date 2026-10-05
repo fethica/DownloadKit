@@ -71,6 +71,9 @@ public final class DownloadListModel: ObservableObject {
     /// Advanced by every playback request and stop; a lookup that finishes under an older
     /// value is obsolete and its lease is ended at once.
     private var playbackToken: UInt64 = 0
+    /// The playback lookup in flight (item and request token), so that the removal of its
+    /// item can supersede it.
+    private var pendingPlayback: (id: DownloadID, token: UInt64)?
 
     /// Creates a model for `controller`, usually the app's ``DownloadKit/DownloadManager``.
     public init(controller: any DownloadControlling, progressStep: Double = 0.01, byteStep: Int64 = 65_536) {
@@ -209,7 +212,11 @@ public final class DownloadListModel: ObservableObject {
             removed = true
         }
         // The removal waits for leases; the playback lease of a removed item is ended here so
-        // the removal can finish.
+        // the removal can finish, and a playback lookup still in flight for a removed item is
+        // made obsolete, so the lease it returns is ended instead of installed.
+        if removed, let pending = pendingPlayback, request.ids.contains(pending.id) {
+            playbackToken &+= 1
+        }
         if removed, let lease = playbackLease, request.ids.contains(lease.id) {
             await releasePlaybackLease()
         }
@@ -324,6 +331,8 @@ public final class DownloadListModel: ObservableObject {
     public func beginPlayback(of id: DownloadID) async -> LocalFileAccess? {
         playbackToken &+= 1
         let token = playbackToken
+        pendingPlayback = (id, token)
+        defer { if pendingPlayback?.token == token { pendingPlayback = nil } }
         await releasePlaybackLease()
         guard token == playbackToken else { return nil }
         let access = await openLocalFile(for: id)
@@ -350,9 +359,15 @@ public final class DownloadListModel: ObservableObject {
     }
 
     /// A playback lease on an item that is now being removed would hold the removal; it is
-    /// ended. While a lease is held no playback lookup is in flight (each one releases the
-    /// lease first), so no newer request is overtaken here.
+    /// ended. A playback lookup still in flight for an item being removed is made obsolete,
+    /// so the lease it returns is ended instead of installed. While a lease is held no
+    /// playback lookup is in flight (each one releases the lease first), so no newer request
+    /// is overtaken here.
     private func endPlaybackIfRemoved(by snapshots: [DownloadSnapshot]) {
+        if let pending = pendingPlayback,
+           snapshots.contains(where: { $0.id == pending.id && $0.state == .removing }) {
+            playbackToken &+= 1
+        }
         guard let lease = playbackLease,
               snapshots.contains(where: { $0.id == lease.id && $0.state == .removing }) else { return }
         playbackLease = nil

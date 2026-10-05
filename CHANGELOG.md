@@ -4,6 +4,9 @@ All notable changes to this project are documented here.
 
 ## Unreleased
 
+- `DownloadListModel` supersedes a playback lookup still in flight when its item is removed, whether through a confirmed removal or one observed from the manager: the late lease is ended instead of installed, so a removal never waits on a lease the user no longer wants.
+- The reconciliation deadline is published to snapshot subscribers at once, outside the serialized step chain, so a step suspended on the index or a host hook no longer delays the status.
+- The fixture server accepts only `HTTP/1.1` and `HTTP/1.0` request lines, header names made of token characters, and targets free of whitespace and control bytes; anything else is a 400.
 ### Added
 - `DownloadKit` core library (Foundation only, iOS 14+) and optional `DownloadKitUI` library (iOS 15+).
 - `DownloadManager`: host-owned, explicit configuration, `start()` before commands, single owner per storage root and session identifier, serialised commands (`enqueue`, `pause`, `resume`, `cancel`, `retry`, `remove`, `setDefaultPolicy`, `setPolicy`), throttled and bounded snapshot stream (`DownloadSnapshotStream`), `localFile(for:)` with read leases, `handleBackgroundEvents(forSession:completionHandler:)`, `flushPendingWork()`, `reconciliationStatus()` (`ReconciliationStatus`, `ReconciliationUnresolvedReason`) and `unreferencedFiles()`, which reports unknown files in `staging/` and `media/` without deleting them.
