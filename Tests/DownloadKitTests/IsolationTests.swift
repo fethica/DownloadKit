@@ -5,8 +5,10 @@
 //  Lexical tripwires over the library sources.
 //
 //  What they do: flag any import other than a plain `import Foundation` in the core (an
-//  indented, attributed or `@preconcurrency` import fails too), and flag the listed
-//  concurrency escape hatches in both libraries regardless of spacing.
+//  indented, attributed or `@preconcurrency` import fails too), except for the two system
+//  libraries the adapters need, each confined to one named file (`import SQLite3` in the index
+//  store, `import CryptoKit` in the content hasher), and flag the listed concurrency escape
+//  hatches in both libraries regardless of spacing.
 //
 //  What they do not prove: they read text, not the compiled program. They cannot see through
 //  macros, generated code, conditional compilation or an escape hatch spelled some other way,
@@ -51,11 +53,22 @@ final class IsolationTests: XCTestCase {
         XCTAssertEqual(importDeclarations(in: text), ["import Foundation", "import Network", "@preconcurrency import Dispatch"])
     }
 
+    /// The only imports besides Foundation, and the one file each may appear in.
+    private let systemLibraryImports = [
+        "SQLiteIndexStore.swift": "import SQLite3",
+        "ContentHasher.swift": "import CryptoKit",
+    ]
+
     func testCoreImportsFoundationOnly() throws {
+        var seen: Set<String> = []
         for (name, text) in try sources(in: "DownloadKit") {
             let imports = importDeclarations(in: text)
-            XCTAssertTrue(imports.allSatisfy { $0 == "import Foundation" }, "\(name) imports \(imports)")
+            var allowed: Set<String> = ["import Foundation"]
+            if let extra = systemLibraryImports[name] { allowed.insert(extra) }
+            XCTAssertTrue(imports.allSatisfy { allowed.contains($0) }, "\(name) imports \(imports)")
+            if imports.contains(where: { $0 != "import Foundation" }) { seen.insert(name) }
         }
+        XCTAssertTrue(seen.isSubset(of: Set(systemLibraryImports.keys)))
     }
 
     func testNoConcurrencyEscapeHatches() throws {
