@@ -24,11 +24,13 @@ public struct DownloadConfiguration: Sendable {
     /// How long start-up reconciliation waits for the session to report its backlog
     /// delivered. When it passes, nothing is concluded about attempts whose task could not be
     /// found: they keep their intent and bytes, and ``DownloadManager/reconciliationStatus()``
-    /// reports them as ``ReconciliationStatus/unresolved(items:reason:)``.
+    /// reports them as ``ReconciliationStatus/unresolved(items:reason:)``. The status changes at
+    /// the deadline even while an index write is suspended.
     public var reconciliationTimeout: TimeInterval
     /// The longest a background-wake completion handler waits for the wake's events to be
     /// committed. When the index cannot be updated in time, the handler is called anyway and
     /// the uncommitted events stay unacknowledged with the session, which delivers them again.
+    /// The budget holds even while an index write is suspended.
     public var backgroundWakeBudget: TimeInterval
     /// The time a finaliser is given to validate and rename one file. A finaliser that cannot
     /// finish by then defers; the capture stays and is finalised again later.

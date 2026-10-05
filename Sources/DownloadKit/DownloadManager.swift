@@ -75,7 +75,8 @@ public final class DownloadManager: Sendable {
     /// ``LocalFileLease`` is outstanding; otherwise it is kept until the last lease ends, so
     /// another manager cannot take over the root and delete a file that is still leased. A
     /// detached manager never deletes files; the next owner finishes pending removals when it
-    /// starts.
+    /// starts. Releasing the manager without detaching does not end a running finaliser's
+    /// claim either: the root stays owned until the finaliser returned.
     public func detach() async {
         await engine.detach()
     }
@@ -140,6 +141,10 @@ public final class DownloadManager: Sendable {
         try await engine.run(.pause(id))
     }
 
+    /// Starts a new attempt for a paused item. When the attempt that was paused is not yet
+    /// confirmed (its task may still run, see ``reconciliationStatus()``), no replacement is
+    /// created: the item stays paused until that task is found and adopted, its completion
+    /// arrives, or its end is proven.
     public func resume(_ id: DownloadID) async throws {
         try await engine.run(.resume(id))
     }
@@ -150,7 +155,8 @@ public final class DownloadManager: Sendable {
 
     /// Starts a new attempt for a failed, missing or retry-waiting item and resets its
     /// automatic retry count. For an `unauthorized` failure the ``URLRefreshing`` is asked for a
-    /// fresh URL first.
+    /// fresh URL first. Like ``resume(_:)``, a retry of a cancelled attempt that is not yet
+    /// confirmed creates no replacement until that attempt's disposition is known.
     public func retry(_ id: DownloadID) async throws {
         try await engine.run(.retry(id))
     }

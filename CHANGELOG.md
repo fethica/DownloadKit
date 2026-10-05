@@ -11,6 +11,9 @@ All notable changes to this project are documented here.
 - A validating finaliser, used by `DownloadManager(configuration:urlRefresher:)`: response evidence, length, HTML sniffing and the host's SHA-256 in bounded chunks, then flush and atomic rename; repeatable after an interrupted rename; defers at its deadline, on cancellation and for protected files.
 
 ### Changed
+- `resume` and `retry` of a paused or cancelled attempt that is not yet confirmed create no replacement. The item stays stopped until the old task is found (adopted for the restart, or cancelled when none was asked for), its completion arrives (validated and kept, never deleted as stale) or its end is proven by the backlog marker or a reported failure. This holds after `reconciliationTimeout` too.
+- Session events are received, and a wake's marker arms `backgroundWakeBudget`, outside the serial application of events; `reconciliationTimeout` records the unresolved status outside it as well. Both now hold while an index write is suspended; uncommitted events stay unacknowledged and the storage claim is kept while the write is outstanding.
+- A running finaliser holds its manager's engine, and with it the storage claim, until it returned, also after the manager and every lease were released. Port signatures are unchanged.
 - `ResponseValidators` gains `statusCode` and `mediaType` (optional, decoded as absent from older data).
 - A completed file may be named `media/item-<generation>.<ext>`, with the extension chosen from an allowlist by declared media type, then by the source URL's extension.
 - `DownloadManager(configuration:urlRefresher:)` now validates and finalises captured files instead of leaving them captured.
