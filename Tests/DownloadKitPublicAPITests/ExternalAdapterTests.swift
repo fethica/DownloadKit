@@ -111,4 +111,18 @@ final class ExternalAdapterTests: XCTestCase {
         let status = try await EmptyFileSystem().inspectItem(at: URL(fileURLWithPath: "/nonexistent/file"))
         XCTAssertEqual(status, .absent)
     }
+
+    @MainActor
+    func testHostCanWireTheRelaunchReceiverAndSessionAwareDescriptions() throws {
+        let wakes = BackgroundTransferEvents(sessionIdentifiers: ["external.session"])
+        XCTAssertTrue(wakes.handleEvents(forSession: "external.session") {})
+        XCTAssertFalse(wakes.handleEvents(forSession: "other.session") {})
+        XCTAssertEqual(wakes.pendingHandlerCount(forSession: "external.session"), 1)
+
+        let submission = TransferSubmission(itemID: try DownloadID("episode-1"), generation: 2, url: URL(string: "https://media.example.com/1")!, policy: .default, resumeDataPath: nil, expectedLength: nil)
+        let task = SystemTransferTask(taskIdentifier: 4, taskDescription: submission.taskDescription(sessionIdentifier: "external.session"))
+        XCTAssertEqual(task.reference(inSession: "external.session")?.generation, 2)
+        XCTAssertNil(task.reference(inSession: "other.session"))
+        _ = URLSessionTransport(options: .init(mode: .background, resourceTimeout: 3_600))
+    }
 }

@@ -63,8 +63,8 @@ struct Harness {
         )
     }
 
-    func makeManager(urlRefresher: (any URLRefreshing)? = nil) -> DownloadManager {
-        DownloadManager(configuration: configuration, urlRefresher: urlRefresher, finalizer: finalizer)
+    func makeManager(urlRefresher: (any URLRefreshing)? = nil, backgroundEvents: BackgroundTransferEvents? = nil) -> DownloadManager {
+        DownloadManager(configuration: configuration, urlRefresher: urlRefresher, finalizer: finalizer, backgroundEvents: backgroundEvents)
     }
 
     var root: URL {
