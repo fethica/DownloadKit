@@ -3,7 +3,7 @@
 //  DownloadKitTests
 //
 //  Unconfirmed attempts, one capture per attempt, the completion/stop linearisation point,
-//  the planned finalisation destination and persisted cleanup intent.
+//  the planned finalisation destination, persisted cleanup intent and deferred restarts.
 //
 
 import XCTest
@@ -184,5 +184,119 @@ final class StateMachineOwnershipTests: XCTestCase {
         let restored = DownloadStateMachine(contents: IndexContents(nextGeneration: machine.nextGeneration, records: [record]), sessionIdentifier: "session", defaultPolicy: .default, retryPolicy: .default)
 
         XCTAssertEqual(restored.record("a")?.finalizationDestination, .media(generation: generation))
+    }
+
+    // MARK: restart commands on an unconfirmed attempt
+
+    /// A submission whose binding was never written: the attempt is unconfirmed.
+    private func submittedUnbound() throws -> (DownloadStateMachine, UInt64) {
+        var machine = DownloadStateMachine.fresh()
+        _ = try machine.handle(.enqueue(makeRequest("a")), now: referenceDate)
+        let generation = machine.generation("a")
+        XCTAssertTrue(machine.isUnconfirmed(try XCTUnwrap(machine.record("a"))))
+        return (machine, generation)
+    }
+
+    func testResumeAfterPauseOfAnUnconfirmedAttemptCreatesNoReplacement() throws {
+        var (machine, generation) = try submittedUnbound()
+        _ = try machine.handle(.pause(itemID("a")), now: referenceDate)
+
+        let outcome = try machine.handle(.resume(itemID("a")), now: referenceDate)
+
+        XCTAssertTrue(outcome.submissions.isEmpty)
+        XCTAssertEqual(machine.generation("a"), generation)
+        XCTAssertEqual(machine.phase("a"), .paused, "the stop stays in effect until the old attempt is known")
+        XCTAssertTrue(machine.deferredRestarts.contains(itemID("a")))
+    }
+
+    func testRetryAfterCancelOfAnUnconfirmedAttemptCreatesNoReplacement() throws {
+        var (machine, generation) = try submittedUnbound()
+        _ = try machine.handle(.cancel(itemID("a")), now: referenceDate)
+
+        let outcome = try machine.handle(.retry(itemID("a")), now: referenceDate)
+
+        XCTAssertTrue(outcome.submissions.isEmpty)
+        XCTAssertEqual(machine.generation("a"), generation)
+        XCTAssertEqual(machine.phase("a"), .failed(DownloadFailure(kind: .cancelled)))
+    }
+
+    func testLateCompletionAfterADeferredRetryIsFinalisedNotDiscarded() throws {
+        var (machine, generation) = try submittedUnbound()
+        _ = try machine.handle(.cancel(itemID("a")), now: referenceDate)
+        _ = try machine.handle(.retry(itemID("a")), now: referenceDate)
+        let captured = path("staging/late")
+
+        let outcome = machine.send(.finished(reference("a", generation: generation), captured: captured, bytes: 10, validators: nil))
+
+        XCTAssertFalse(machine.cleanup.contains(captured), "the only downloaded copy is never queued for deletion")
+        XCTAssertEqual(machine.record("a")?.stagingPath, captured)
+        XCTAssertEqual(machine.phase("a"), .active)
+        XCTAssertEqual(outcome.effects, [.finalize(itemID("a"), generation: generation, captured: captured)])
+        XCTAssertFalse(machine.deferredRestarts.contains(itemID("a")))
+    }
+
+    func testLateCompletionAfterACancelWithoutRetryIsKeptWithTheRecord() throws {
+        var (machine, generation) = try submittedUnbound()
+        _ = try machine.handle(.cancel(itemID("a")), now: referenceDate)
+        let captured = path("staging/late")
+
+        let outcome = machine.send(.finished(reference("a", generation: generation), captured: captured, bytes: 10, validators: nil))
+
+        XCTAssertFalse(machine.cleanup.contains(captured))
+        XCTAssertEqual(machine.record("a")?.stagingPath, captured)
+        XCTAssertEqual(machine.phase("a"), .failed(DownloadFailure(kind: .cancelled)))
+        XCTAssertTrue(outcome.effects.isEmpty)
+    }
+
+    func testFoundTaskIsAdoptedByADeferredResume() throws {
+        var (machine, generation) = try submittedUnbound()
+        _ = try machine.handle(.pause(itemID("a")), now: referenceDate)
+        _ = try machine.handle(.resume(itemID("a")), now: referenceDate)
+
+        let outcome = machine.handle(.taskBound(itemID("a"), generation: generation, taskIdentifier: 9), now: referenceDate, jitter: 0)
+
+        XCTAssertTrue(outcome.submissions.isEmpty)
+        XCTAssertTrue(outcome.cancellations.isEmpty)
+        XCTAssertEqual(machine.phase("a"), .queued)
+        XCTAssertEqual(machine.record("a")?.binding?.taskIdentifier, 9)
+        XCTAssertFalse(machine.isUnconfirmed(try XCTUnwrap(machine.record("a"))))
+    }
+
+    func testFoundTaskOfAStoppedUnconfirmedAttemptIsCancelledExactly() throws {
+        var (machine, generation) = try submittedUnbound()
+        _ = try machine.handle(.pause(itemID("a")), now: referenceDate)
+
+        let outcome = machine.send(.progress(reference("a", generation: generation, task: 9), bytesWritten: 4, expectedBytes: 10))
+
+        XCTAssertEqual(outcome.effects, [.cancelTask(itemID("a"), taskIdentifier: 9, producingResumeData: true)])
+        XCTAssertEqual(machine.record("a")?.stoppingBinding?.taskIdentifier, 9)
+        XCTAssertEqual(machine.phase("a"), .paused)
+
+        let resumed = try machine.handle(.resume(itemID("a")), now: referenceDate)
+        XCTAssertEqual(resumed.submissions.map(\.generation), [generation + 1], "the old attempt is known now")
+    }
+
+    func testProvenEndStartsTheDeferredRestartOnce() throws {
+        var (machine, generation) = try submittedUnbound()
+        _ = try machine.handle(.pause(itemID("a")), now: referenceDate)
+        _ = try machine.handle(.resume(itemID("a")), now: referenceDate)
+
+        let outcome = machine.handle(.submissionFailed(itemID("a"), generation: generation, .unknown), now: referenceDate, jitter: 0)
+        let again = machine.handle(.orphanedIntent(itemID("a"), generation: generation), now: referenceDate, jitter: 0)
+
+        XCTAssertEqual(outcome.submissions.map(\.generation), [generation + 1])
+        XCTAssertTrue(again.submissions.isEmpty)
+    }
+
+    func testPauseAfterADeferredResumeDropsIt() throws {
+        var (machine, generation) = try submittedUnbound()
+        _ = try machine.handle(.pause(itemID("a")), now: referenceDate)
+        _ = try machine.handle(.resume(itemID("a")), now: referenceDate)
+        _ = try machine.handle(.pause(itemID("a")), now: referenceDate)
+
+        let outcome = machine.handle(.orphanedIntent(itemID("a"), generation: generation), now: referenceDate, jitter: 0)
+
+        XCTAssertTrue(outcome.submissions.isEmpty, "the latest command was a pause")
+        XCTAssertEqual(machine.phase("a"), .paused)
     }
 }

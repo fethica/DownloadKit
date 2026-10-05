@@ -4,8 +4,9 @@
 //
 //  Restart with an initially allowed path, file workers as ownership claims, leases ended
 //  through a successor, replay before recovered finalisation, exact stop identity, the
-//  reconciliation fence and wake budget, persisted cleanup intent and the completion/stop
-//  linearisation point.
+//  reconciliation fence and wake budget, persisted cleanup intent, the completion/stop
+//  linearisation point, restart commands on unconfirmed attempts, worker lifetime after the
+//  manager is released, and deadlines that hold while an index write is suspended.
 //
 
 import XCTest
@@ -520,5 +521,271 @@ final class DownloadManagerOwnershipTests: XCTestCase {
         XCTAssertEqual(state, .completed(at: referenceDate), file: file, line: line)
         XCTAssertEqual(submissions.count, 1, "no new transfer", file: file, line: line)
         XCTAssertEqual(generations, [1, 1], file: file, line: line)
+    }
+
+    // MARK: restart commands while an attempt is unconfirmed
+
+    private enum RestartPair {
+        case pauseThenResume
+        case cancelThenRetry
+    }
+
+    /// A restored queued attempt whose binding was never written, with a session that
+    /// withholds its backlog marker.
+    private func unconfirmedAttempt(reconciliationTimeout: TimeInterval = 5) async throws -> (Harness, DownloadManager, UInt64) {
+        let sessionIdentifier = Harness.uniqueName("session")
+        var machine = DownloadStateMachine.fresh(session: sessionIdentifier)
+        _ = try machine.handle(.enqueue(makeRequest("a")), now: referenceDate)
+        let generation = machine.generation("a")
+        let store = InMemoryIndexStore(contents: contents(of: machine))
+        let session = FakeTransferSession(identifier: sessionIdentifier, deliversBacklogMarker: false)
+        let harness = try Harness(sessionIdentifier: sessionIdentifier, store: store, session: session, reconciliationTimeout: reconciliationTimeout)
+        let manager = harness.makeManager()
+        try await manager.start()
+        return (harness, manager, generation)
+    }
+
+    private func send(_ pair: RestartPair, to manager: DownloadManager) async throws {
+        switch pair {
+        case .pauseThenResume:
+            try await manager.pause(itemID("a"))
+            try await manager.resume(itemID("a"))
+        case .cancelThenRetry:
+            try await manager.cancel(itemID("a"))
+            try await manager.retry(itemID("a"))
+        }
+    }
+
+    private func assertRestartKeepsTheUnconfirmedAttempt(_ pair: RestartPair, afterTimeout: Bool, file: StaticString = #filePath, line: UInt = #line) async throws {
+        let (harness, manager, generation) = try await unconfirmedAttempt()
+        let unresolved = ReconciliationStatus.unresolved(items: [itemID("a")], reason: .deadlineExceeded)
+        if afterTimeout {
+            await harness.clock.advance(by: 5)
+            await eventually("deadline handled", file: file, line: line) { await manager.reconciliationStatus() == unresolved }
+        }
+
+        try await send(pair, to: manager)
+
+        let submissions = await harness.session.submissions
+        let stored = await harness.store.contents?.records.first
+        XCTAssertTrue(submissions.isEmpty, "no replacement while the old attempt may still run", file: file, line: line)
+        XCTAssertEqual(stored?.generation, generation, file: file, line: line)
+        if afterTimeout {
+            let status = await manager.reconciliationStatus()
+            XCTAssertEqual(status, unresolved, file: file, line: line)
+        }
+
+        // The old attempt's completion is delivered late.
+        let captured = path("staging/late")
+        await harness.fileSystem.putFile(harness.url(captured), size: 10)
+        let sequence = await harness.session.emit(.finished(reference("a", generation: generation, task: 55), captured: captured, bytes: 10, validators: nil))
+        await eventually("late completion applied", file: file, line: line) { await harness.session.acknowledged == sequence }
+        await settle(manager)
+
+        let state = await manager.state(for: itemID("a"))
+        let cleanup = await harness.store.contents?.cleanupPaths ?? []
+        let finalExists = await harness.fileSystem.hasFile(harness.url(.media(generation: generation)))
+        let replacements = await harness.session.submissions
+        guard case .completed = state else { return XCTFail("expected completed, got \(state)", file: file, line: line) }
+        XCTAssertFalse(cleanup.contains(captured), "the late capture is owned, never queued for deletion", file: file, line: line)
+        XCTAssertTrue(finalExists, file: file, line: line)
+        XCTAssertTrue(replacements.isEmpty, file: file, line: line)
+    }
+
+    func testPauseThenResumeKeepsTheUnconfirmedAttemptBeforeTheDeadline() async throws {
+        try await assertRestartKeepsTheUnconfirmedAttempt(.pauseThenResume, afterTimeout: false)
+    }
+
+    func testPauseThenResumeKeepsTheUnconfirmedAttemptAfterTheDeadline() async throws {
+        try await assertRestartKeepsTheUnconfirmedAttempt(.pauseThenResume, afterTimeout: true)
+    }
+
+    func testCancelThenRetryKeepsTheUnconfirmedAttemptBeforeTheDeadline() async throws {
+        try await assertRestartKeepsTheUnconfirmedAttempt(.cancelThenRetry, afterTimeout: false)
+    }
+
+    func testCancelThenRetryKeepsTheUnconfirmedAttemptAfterTheDeadline() async throws {
+        try await assertRestartKeepsTheUnconfirmedAttempt(.cancelThenRetry, afterTimeout: true)
+    }
+
+    func testDeferredResumeStartsOneAttemptOnceTheBacklogProvesTheOldOneGone() async throws {
+        let (harness, manager, generation) = try await unconfirmedAttempt()
+        try await send(.pauseThenResume, to: manager)
+
+        await harness.session.emit(payload: .backlogDelivered)
+        await eventually("marker applied") { await manager.reconciliationStatus() == .resolved }
+
+        let submissions = await harness.session.submissions
+        let state = await manager.state(for: itemID("a"))
+        XCTAssertEqual(submissions.map(\.generation), [generation + 1])
+        XCTAssertEqual(state, .queued)
+    }
+
+    func testDeferredRetryAdoptsTheOldTaskFoundAfterTheDeadline() async throws {
+        let (harness, manager, generation) = try await unconfirmedAttempt()
+        await harness.clock.advance(by: 5)
+        await eventually("unresolved") {
+            if case .unresolved = await manager.reconciliationStatus() { return true } else { return false }
+        }
+        try await send(.cancelThenRetry, to: manager)
+
+        await harness.session.addSystemTask(reference("a", generation: generation, task: 77))
+        try await manager.flushPendingWork()
+
+        let submissions = await harness.session.submissions
+        let cancellations = await harness.session.cancellations
+        let stored = await harness.store.contents?.records.first
+        XCTAssertTrue(submissions.isEmpty)
+        XCTAssertTrue(cancellations.isEmpty)
+        XCTAssertEqual(stored?.binding?.taskIdentifier, 77)
+        XCTAssertEqual(stored?.phase, .queued)
+    }
+
+    func testFoundTaskOfAPausedUnconfirmedAttemptIsCancelled() async throws {
+        let (harness, manager, generation) = try await unconfirmedAttempt()
+        await harness.clock.advance(by: 5)
+        await eventually("unresolved") {
+            if case .unresolved = await manager.reconciliationStatus() { return true } else { return false }
+        }
+        try await manager.pause(itemID("a"))
+
+        await harness.session.addSystemTask(reference("a", generation: generation, task: 77))
+        try await manager.flushPendingWork()
+
+        let cancellations = await harness.session.cancellations
+        let state = await manager.state(for: itemID("a"))
+        XCTAssertEqual(cancellations, [FakeTransferSession.Cancellation(taskIdentifier: 77, producingResumeData: true)])
+        XCTAssertEqual(state, .paused(resumable: false))
+    }
+
+    // MARK: worker lifetime
+
+    func testReleasedManagerKeepsTheRootWhileItsFinaliserRuns() async throws {
+        let first = try Harness()
+        var owner: DownloadManager? = first.makeManager()
+        try await owner?.start()
+        _ = try await suspendFinalisation(first, manager: try XCTUnwrap(owner), gate: .beforeRename)
+        weak let engine = owner?.engine
+
+        owner = nil
+        for _ in 0..<2_000 where engine != nil { await Task.yield() }
+        XCTAssertNotNil(engine, "the running worker keeps its engine")
+        let next = try restart(first, session: FakeTransferSession(identifier: first.sessionIdentifier)).makeManager()
+        await assertThrows(.ownerAlreadyActive) { try await next.start() }
+
+        await first.finalizer.release()
+        await eventually("root freed once the worker returned") { (try? await next.start()) != nil }
+        await settle(next)
+
+        let state = await next.state(for: itemID("a"))
+        let finalExists = await first.fileSystem.hasFile(first.url(.media(generation: 1)))
+        XCTAssertEqual(state, .completed(at: referenceDate))
+        XCTAssertTrue(finalExists)
+    }
+
+    func testReleasedManagerWithAnEndedLeaseKeepsTheRootUntilItsWorkerReturns() async throws {
+        let first = try Harness()
+        var owner: DownloadManager? = first.makeManager()
+        try await owner?.start()
+        try await completeItem("a", manager: try XCTUnwrap(owner), harness: first)
+        var lease: LocalFileLease?
+        if case .available(let available)? = try await owner?.localFile(for: itemID("a")) { lease = available }
+        XCTAssertNotNil(lease)
+
+        // Another item's finaliser is suspended mid-way.
+        try await owner?.enqueue(makeRequest("b"))
+        let referenceB = try await XCTUnwrapAsync(await first.session.latestReference(for: itemID("b")))
+        let captured = path("staging/b")
+        await first.fileSystem.putFile(first.url(captured), size: 10)
+        await first.finalizer.setGate(.beforeRename)
+        await first.session.emit(.finished(referenceB, captured: captured, bytes: 10, validators: nil))
+        await eventually("finaliser suspended") { await first.finalizer.suspendedCount == 1 }
+        weak let engine = owner?.engine
+
+        // Release the manager, end the last lease through a successor, drop the lease value.
+        owner = nil
+        let next = try restart(first, session: FakeTransferSession(identifier: first.sessionIdentifier)).makeManager()
+        if let held = lease { await next.endAccess(held) }
+        lease = nil
+        for _ in 0..<2_000 where engine != nil { await Task.yield() }
+
+        XCTAssertNotNil(engine, "the running worker keeps its engine")
+        await assertThrows(.ownerAlreadyActive) { try await next.start() }
+
+        await first.finalizer.release()
+        await eventually("root freed once the worker returned") { (try? await next.start()) != nil }
+        await settle(next)
+
+        let stateA = await next.state(for: itemID("a"))
+        let stateB = await next.state(for: itemID("b"))
+        XCTAssertEqual(stateA, .completed(at: referenceDate))
+        XCTAssertEqual(stateB, .completed(at: referenceDate), "the successor recovers the worker's rename")
+    }
+
+    // MARK: suspended index writes
+
+    func testWakeHandlerIsReleasedAtTheBudgetWhileAWriteIsSuspended() async throws {
+        let harness = try Harness(reconciliationTimeout: 20, backgroundWakeBudget: 10)
+        let manager = harness.makeManager()
+        let counter = CallCounter()
+        _ = await MainActor.run { manager.handleBackgroundEvents(forSession: harness.sessionIdentifier) { counter.count += 1 } }
+        try await manager.start()
+        try await manager.enqueue(makeRequest("a"))
+        let reference = try await XCTUnwrapAsync(await harness.session.latestReference(for: itemID("a")))
+        let captured = path("staging/a")
+        await harness.fileSystem.putFile(harness.url(captured), size: 10)
+
+        await harness.store.setHoldWrites(true)
+        let finished = await harness.session.emit(.finished(reference, captured: captured, bytes: 10, validators: nil))
+        let marker = await harness.session.emit(payload: .backgroundEventsFinished)
+        await eventually("write suspended") { await harness.store.heldWriteCount == 1 }
+        await eventually("wake budget armed while the write waits") { await harness.clock.sleeperCount == 1 }
+
+        await harness.clock.advance(by: 10)
+        await eventually("handler released at the budget") { await MainActor.run { counter.count } == 1 }
+        await harness.clock.advance(by: 30)
+        let held = await harness.store.heldWriteCount
+        let acknowledged = await harness.session.acknowledged ?? 0
+        XCTAssertEqual(held, 1, "the write is still suspended past both budgets")
+        XCTAssertLessThan(acknowledged, finished, "uncommitted events stay with the session")
+
+        await harness.store.setHoldWrites(false)
+        await eventually("events applied") { await harness.session.acknowledged == marker }
+        await settle(manager)
+
+        let state = await manager.state(for: itemID("a"))
+        let calls = await MainActor.run { counter.count }
+        guard case .completed = state else { return XCTFail("expected completed, got \(state)") }
+        XCTAssertEqual(calls, 1, "the handler is not called a second time")
+    }
+
+    func testReconciliationDeadlineIsRecordedWhileAWriteIsSuspended() async throws {
+        let (harness, manager, generation) = try await unconfirmedAttempt()
+        let open = await manager.reconciliationStatus()
+        XCTAssertEqual(open, .awaitingBacklog(deadline: referenceDate.addingTimeInterval(5)))
+
+        await harness.store.setHoldWrites(true)
+        let blocked = Task { try await manager.enqueue(makeRequest("b")) }
+        await eventually("write suspended") { await harness.store.heldWriteCount == 1 }
+        await harness.clock.advance(by: 25)
+
+        await eventually("deadline recorded") {
+            await manager.reconciliationStatus() == .unresolved(items: [itemID("a")], reason: .deadlineExceeded)
+        }
+        let records = await harness.store.contents?.records ?? []
+        XCTAssertEqual(records.first { $0.id == itemID("a") }?.generation, generation, "nothing is concluded")
+
+        // The outstanding writer keeps the root owned.
+        let detaching = Task { await manager.detach() }
+        let next = try restart(harness, session: FakeTransferSession(identifier: harness.sessionIdentifier)).makeManager()
+        await assertThrows(.ownerAlreadyActive) { try await next.start() }
+
+        await harness.store.setHoldWrites(false)
+        _ = try await blocked.value
+        await detaching.value
+        try await next.start()
+
+        let submissions = await harness.session.submissions
+        XCTAssertFalse(submissions.contains { $0.itemID == itemID("a") }, "a timeout is not proof of absence")
     }
 }

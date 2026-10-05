@@ -12,12 +12,19 @@
 //  rejected is kept and retried at the start of every later step (and by flushPendingWork);
 //  only advisory progress and waiting events may be dropped.
 //
+//  Reception: session events are appended to the inbox, and a wake marker arms the wake
+//  budget, as they arrive, outside the chain; only their application is a step. A step that
+//  waits on the index therefore cannot hide a later marker, and the wake budget and the
+//  reconciliation deadline are both enforced outside the chain.
+//
 //  File workers: a finaliser runs outside the chain and is an ownership claim on its item's
 //  files and on the storage root. Its destination is persisted with the capture before it
-//  starts. Removal deletes the item's files, and detach releases the root, only after the
-//  worker returned. Neither waits for the worker inside a step (the worker's result is itself
-//  applied as a step): the worker releases its claim first, outside the chain, and the waiting
-//  work resumes at the next step or, for detach, after the detach step returned.
+//  starts. A running worker keeps its engine (and so the storage claim) alive even when the
+//  manager and every lease are gone. Removal deletes the item's files, and detach releases
+//  the root, only after the worker returned. Neither waits for the worker inside a step (the
+//  worker's result is itself applied as a step): the worker releases its claim first, outside
+//  the chain, and the waiting work resumes at the next step or, for detach, after the detach
+//  step returned.
 //
 
 import Foundation
@@ -107,6 +114,11 @@ actor DownloadEngine {
 
     /// Session events not yet applied, oldest first.
     private var inbox: [TransferSessionEvent] = []
+    /// A drain step is queued and has not started yet.
+    private var drainQueued = false
+    /// The inbox head could not be committed at the last drain. Entries merely received and
+    /// not yet drained do not count.
+    private var inboxBlocked = false
     /// Critical internal or directly ingested events whose index write was rejected.
     private var retained: [Event] = []
     /// Awaiting-transfer records without a live task at start. Decided only after the session
@@ -134,6 +146,12 @@ actor DownloadEngine {
     /// Runs `operation` after every previously submitted step has finished. Retained work is
     /// retried first.
     private func serialized<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) async throws -> T {
+        try await submitStep(operation).value
+    }
+
+    /// Appends `operation` to the chain without waiting for it.
+    @discardableResult
+    private func submitStep<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) -> Task<T, any Error> {
         let previous = tail
         let step = Task<T, any Error> { [self] in
             await previous?.value
@@ -148,7 +166,7 @@ actor DownloadEngine {
             }
         }
         tail = Task { _ = await step.result }
-        return try await step.value
+        return step
     }
 
     private func requireRunning() throws {
@@ -258,8 +276,9 @@ actor DownloadEngine {
     /// 5. Awaiting records with no live task become orphan candidates. The fence stays open
     ///    until the session reports its backlog delivered (or a wake's events finished), so a
     ///    completion buffered before start is applied first; only then are candidates
-    ///    resubmitted. At ``DownloadConfiguration/reconciliationTimeout`` the fence becomes
-    ///    unresolved: nothing is concluded and no replacement is created.
+    ///    resubmitted. A candidate paused or cancelled meanwhile stays a candidate: a stop does
+    ///    not prove that its task ended. At ``DownloadConfiguration/reconciliationTimeout`` the
+    ///    fence becomes unresolved: nothing is concluded and no replacement is created.
     private func reconcile() async {
         guard let session else { return }
         let tasks = await session.systemTasks().sorted { $0.taskIdentifier < $1.taskIdentifier }
@@ -357,18 +376,25 @@ actor DownloadEngine {
         }
     }
 
+    /// The backlog marker did not come in time. The status becomes unresolved at once,
+    /// outside the chain, so a step waiting on the index cannot hold it past the deadline. This
+    /// concludes nothing and changes no record; the follow-up runs as a step.
     private func fenceDeadlinePassed() async {
-        _ = try? await serialized { [self] in await self.runFenceDeadline() }
+        fenceTimer = nil
+        guard lifecycle == .running, case .open = fence else { return }
+        fence = .unresolved(.deadlineExceeded)
+        submitStep { [self] in await self.runFenceDeadline() }
     }
 
-    /// The backlog marker did not come in time. Tasks that can be found now are adopted; for
-    /// the rest nothing is concluded. Recovered finalisations start: a late replay of their
-    /// completion can no longer capture again (one capture per attempt).
+    /// Tasks that can be found now are adopted; for the rest nothing is concluded. Recovered
+    /// finalisations start: a late replay of their completion can no longer capture again
+    /// (one capture per attempt).
     private func runFenceDeadline() async {
-        fenceTimer = nil
-        guard case .open = fence, lifecycle == .running else { return }
-        await adoptLiveCandidates()
-        fence = orphanCandidates.isEmpty ? .resolved : .unresolved(.deadlineExceeded)
+        guard lifecycle == .running else { return }
+        if fence == .unresolved(.deadlineExceeded) {
+            await adoptLiveCandidates()
+            if orphanCandidates.isEmpty { markFence(.resolved) }
+        }
         await startRecoveredFinalizations()
     }
 
@@ -413,8 +439,7 @@ actor DownloadEngine {
             live[AttemptKey(id: reference.itemID, generation: reference.generation)] = reference.taskIdentifier
         }
         for key in orphanCandidates.map({ AttemptKey(id: $0.key, generation: $0.value) }).sorted() {
-            guard let record = machine?.records[key.id], record.generation == key.generation,
-                  record.phase.isAwaitingTransfer, record.journal != .captured else {
+            guard isStillCandidate(key) else {
                 orphanCandidates[key.id] = nil
                 continue
             }
@@ -423,6 +448,15 @@ actor DownloadEngine {
                 await applyRetaining(.taskBound(key.id, generation: key.generation, taskIdentifier: taskIdentifier))
             }
         }
+    }
+
+    /// Whether an orphan candidate still needs its disposition: its attempt is current, holds
+    /// no capture, and either expects a transfer or was stopped while unconfirmed (a stop does
+    /// not prove that its task ended).
+    private func isStillCandidate(_ key: AttemptKey) -> Bool {
+        guard let machine, let record = machine.records[key.id], record.generation == key.generation,
+              record.journal != .captured else { return false }
+        return record.phase.isAwaitingTransfer || machine.isStoppedAndUnconfirmed(record)
     }
 
     private func startRecoveredFinalizations() async {
@@ -478,8 +512,7 @@ actor DownloadEngine {
         }
         var complete = true
         for key in orphanCandidates.map({ AttemptKey(id: $0.key, generation: $0.value) }).sorted() {
-            guard let record = machine?.records[key.id], record.generation == key.generation,
-                  record.phase.isAwaitingTransfer, record.journal != .captured else {
+            guard isStillCandidate(key) else {
                 orphanCandidates[key.id] = nil
                 continue
             }
@@ -503,7 +536,7 @@ actor DownloadEngine {
         consumers.append(Task { [weak self] in
             for await event in events {
                 guard let self else { return }
-                await self.receive(event)
+                await self.accept(event)
             }
             await self?.sessionEventsEnded()
         })
@@ -602,7 +635,7 @@ actor DownloadEngine {
 
     private func runFlush() async throws {
         try requireRunning()
-        if !retained.isEmpty || !inbox.isEmpty { throw DownloadError.persistenceFailed }
+        if !retained.isEmpty || inboxBlocked { throw DownloadError.persistenceFailed }
         if case .unresolved = fence {
             await adoptLiveCandidates()
             guard orphanCandidates.isEmpty else { throw DownloadError.reconciliationUnresolved }
@@ -630,13 +663,23 @@ actor DownloadEngine {
         _ = try? await serialized { [self] in await self.applyRetaining(event) }
     }
 
-    /// Appends one session event to the ordered inbox and applies as much of it as possible.
-    func receive(_ event: TransferSessionEvent) async {
-        _ = try? await serialized { [self] in await self.enqueueSessionEvent(event) }
+    /// Receives one session event outside the chain: it joins the ordered inbox at once, a
+    /// wake marker arms the wake budget at once, and one drain step is queued to apply it. A
+    /// step suspended on the index delays application, never reception.
+    private func accept(_ event: TransferSessionEvent) async {
+        guard lifecycle == .running else { return }
+        inbox.append(event)
+        if !drainQueued {
+            drainQueued = true
+            submitStep { [self] in await self.runQueuedDrain() }
+        }
+        if hasUnservicedWakeMarker { await armWakeBudget() }
     }
 
-    private func enqueueSessionEvent(_ event: TransferSessionEvent) async {
-        inbox.append(event)
+    /// Usually the step's pending-work prelude has applied the inbox already (one attempt per
+    /// step); this drains only when no drain started since the step was queued.
+    private func runQueuedDrain() async {
+        guard drainQueued else { return }
         await drainInbox()
     }
 
@@ -645,12 +688,19 @@ actor DownloadEngine {
     /// wake budget.
     private func drainInbox() async {
         guard lifecycle == .running else { return }
+        // Events received from here on queue another drain step.
+        drainQueued = false
         var applied: UInt64?
+        var blocked = false
         while let head = inbox.first {
-            guard await process(head) else { break }
+            guard await process(head) else {
+                blocked = true
+                break
+            }
             inbox.removeFirst()
             applied = head.sequence
         }
+        inboxBlocked = blocked
         if let applied, let session { await session.acknowledge(through: applied) }
         if hasUnservicedWakeMarker {
             await armWakeBudget()
@@ -901,15 +951,18 @@ actor DownloadEngine {
             deadline: now.addingTimeInterval(configuration.finalizationBudget)
         )
         let finalizer = self.finalizer
-        finalizations[key] = Task { [weak self] in
+        let claim = WorkerClaim(self)
+        finalizations[key] = Task {
             let result = await finalizer.finalize(request)
-            await self?.finalizationEnded(id, generation: generation, result: result)
+            // The worker holds its engine, and with it the storage claim, until here.
+            await claim.release()?.finalizationEnded(id, generation: generation, result: result)
         }
     }
 
     /// The finaliser returned and can no longer create files. Its claim ends here, outside
     /// the chain; its result is then applied as a step, which also lets a removal waiting for
-    /// it finish.
+    /// it finish. The step holds the engine only like any other step: once the worker's
+    /// retention is gone, a released manager's engine without leases can end.
     private func finalizationEnded(_ id: DownloadID, generation: UInt64, result: FinalizationResult) async {
         finalizations[AttemptKey(id: id, generation: generation)] = nil
         finalizationResultsPending += 1
@@ -919,7 +972,13 @@ actor DownloadEngine {
             for waiter in waiters { waiter.resume() }
         }
         if lifecycle == .detached { await releaseClaimIfQuiet() }
-        _ = try? await serialized { [self] in await self.applyFinalizationResult(id, generation: generation, result: result) }
+        submitStep { [self] in
+            await self.applyFinalizationResult(id, generation: generation, result: result)
+            await self.finalizationResultApplied()
+        }
+    }
+
+    private func finalizationResultApplied() {
         finalizationResultsPending -= 1
     }
 
@@ -1179,5 +1238,22 @@ actor DownloadEngine {
         flushTask = nil
         guard lifecycle == .running, stateVersion != emittedVersion else { return }
         broadcast(at: await dependencies.clock.now())
+    }
+}
+
+/// A running file worker's strong hold on its engine. The engine's storage claim is weak in
+/// the registry, so this hold is what keeps another manager from claiming the root while the
+/// worker can still create files. It is given up exactly once, when the worker returned.
+private actor WorkerClaim {
+    private var engine: DownloadEngine?
+
+    init(_ engine: DownloadEngine) {
+        self.engine = engine
+    }
+
+    /// Hands the engine over for deregistration and drops the hold.
+    func release() -> DownloadEngine? {
+        defer { engine = nil }
+        return engine
     }
 }

@@ -82,6 +82,11 @@ struct DownloadStateMachine: Sendable, Equatable {
     private(set) var unconfirmed: [DownloadID: UInt64] = [:]
     /// Policy changes held back for an unconfirmed attempt, applied once it is resolved.
     private(set) var deferredResubmissions: Set<DownloadID> = []
+    /// Resume or retry commands for a stopped attempt that is still unconfirmed. The stopped
+    /// state is kept and no replacement is created until the old attempt's disposition is
+    /// known: its task is found (it is then adopted as the restarted attempt), its completion
+    /// arrives (it is then finalised), or its end is proven (only then a new attempt starts).
+    private(set) var deferredRestarts: Set<DownloadID> = []
     let sessionIdentifier: String
     let retryPolicy: RetryPolicy
 
@@ -136,6 +141,7 @@ struct DownloadStateMachine: Sendable, Equatable {
 
         case .pause(let id):
             var record = try existing(id)
+            deferredRestarts.remove(id)
             guard record.phase.isTransferring else { break }
             stopTransfer(&record, producingResumeData: true, into: &outcome)
             record.phase = .paused
@@ -144,10 +150,12 @@ struct DownloadStateMachine: Sendable, Equatable {
         case .resume(let id):
             let record = try existing(id)
             guard record.phase == .paused else { break }
+            guard !deferRestart(record) else { break }
             submit(id, now: now, into: &outcome)
 
         case .cancel(let id):
             var record = try existing(id)
+            deferredRestarts.remove(id)
             guard record.phase.isTransferring || record.phase == .paused else { break }
             stopTransfer(&record, producingResumeData: true, into: &outcome)
             record.phase = .failed(DownloadFailure(kind: .cancelled))
@@ -159,9 +167,11 @@ struct DownloadStateMachine: Sendable, Equatable {
             stopTransfer(&record, producingResumeData: true, into: &outcome)
             record.automaticRetryCount = 0
             save(record, now: now, into: &outcome)
+            guard !deferRestart(record) else { break }
             submit(id, now: now, into: &outcome)
 
         case .remove(let id):
+            deferredRestarts.remove(id)
             guard var record = records[id], record.phase != .removing else { break }
             stopTransfer(&record, producingResumeData: false, into: &outcome)
             record.generation = allocateGeneration()
@@ -259,6 +269,10 @@ struct DownloadStateMachine: Sendable, Equatable {
             handleTransfer(transfer, now: now, jitter: jitter, into: &outcome)
 
         case .taskBound(let id, let generation, let taskIdentifier):
+            if let record = records[id], record.generation == generation, isStoppedAndUnconfirmed(record) {
+                stoppedAttemptFound(record, taskIdentifier: taskIdentifier, now: now, into: &outcome)
+                break
+            }
             guard var record = current(id, generation, &outcome), record.phase.isAwaitingTransfer else {
                 // A task nobody wants any more must not keep running.
                 outcome.effects.append(.cancelTask(id, taskIdentifier: taskIdentifier, producingResumeData: false))
@@ -339,6 +353,10 @@ struct DownloadStateMachine: Sendable, Equatable {
             save(record, now: now, into: &outcome)
 
         case .orphanedIntent(let id, let generation):
+            if let record = records[id], record.generation == generation, isStoppedAndUnconfirmed(record) {
+                stoppedAttemptEnded(record, now: now, into: &outcome)
+                break
+            }
             guard let record = current(id, generation, &outcome), record.phase.isAwaitingTransfer, record.journal != .captured else { break }
             unconfirmed[id] = nil
             deferredResubmissions.remove(id)
@@ -365,6 +383,10 @@ struct DownloadStateMachine: Sendable, Equatable {
     private mutating func handleTransfer(_ event: TransferEvent, now: Date, jitter: Double, into outcome: inout Outcome) {
         switch event {
         case .progress(let reference, let bytes, let expected):
+            if let record = records[reference.itemID], record.generation == reference.generation, isStoppedAndUnconfirmed(record) {
+                stoppedAttemptFound(record, taskIdentifier: reference.taskIdentifier, now: now, into: &outcome)
+                break
+            }
             guard var record = current(reference.itemID, reference.generation, &outcome),
                   record.phase.isAwaitingTransfer, record.journal != .captured else { break }
             record.phase = .active
@@ -376,6 +398,10 @@ struct DownloadStateMachine: Sendable, Equatable {
             save(record, now: now, into: &outcome)
 
         case .waiting(let reference, let reason):
+            if let record = records[reference.itemID], record.generation == reference.generation, isStoppedAndUnconfirmed(record) {
+                stoppedAttemptFound(record, taskIdentifier: reference.taskIdentifier, now: now, into: &outcome)
+                break
+            }
             guard var record = current(reference.itemID, reference.generation, &outcome),
                   record.phase.isAwaitingTransfer, record.journal != .captured else { break }
             // Only the manager schedules retries; a session cannot claim one.
@@ -402,6 +428,8 @@ struct DownloadStateMachine: Sendable, Equatable {
                 discardUnowned(captured, into: &outcome)
                 break
             }
+            // A restart asked for while this attempt was unconfirmed is answered by its capture.
+            let restartWaited = deferredRestarts.remove(record.id) != nil
             let finalizeNow: Bool
             switch record.phase {
             case .queued, .active, .waiting, .paused:
@@ -410,7 +438,7 @@ struct DownloadStateMachine: Sendable, Equatable {
             case .failed:
                 // Cancelled (or failed) at this generation: retain the bytes with the record
                 // without publishing a completion. Retry finalises them.
-                finalizeNow = false
+                finalizeNow = restartWaited
             case .completed, .missing, .removing:
                 discardUnowned(captured, into: &outcome)
                 return
@@ -454,6 +482,11 @@ struct DownloadStateMachine: Sendable, Equatable {
     }
 
     private mutating func applyFailure(_ id: DownloadID, _ generation: UInt64, _ failure: TransferFailure, now: Date, jitter: Double, into outcome: inout Outcome) {
+        if let record = records[id], record.generation == generation, isStoppedAndUnconfirmed(record) {
+            // The session reported the end of a stopped attempt that was never confirmed.
+            stoppedAttemptEnded(record, now: now, into: &outcome)
+            return
+        }
         // Failures for paused or cancelled items are the expected echo of our own cancel.
         guard var record = current(id, generation, &outcome), record.phase.isAwaitingTransfer, record.journal != .captured else { return }
         record.binding = nil
@@ -525,6 +558,49 @@ struct DownloadStateMachine: Sendable, Equatable {
             return nil
         }
         return record
+    }
+
+    /// Whether `record` was stopped (paused or cancelled) while its attempt was unconfirmed:
+    /// a task of that attempt may still run, and its completion may still arrive.
+    func isStoppedAndUnconfirmed(_ record: IndexRecord) -> Bool {
+        guard isUnconfirmed(record), record.binding == nil, record.journal != .captured else { return false }
+        switch record.phase {
+        case .paused, .failed: return true
+        default: return false
+        }
+    }
+
+    /// Holds a resume or retry of a stopped, unconfirmed attempt instead of replacing it.
+    /// Returns true when the restart was deferred.
+    private mutating func deferRestart(_ record: IndexRecord) -> Bool {
+        guard isStoppedAndUnconfirmed(record) else { return false }
+        deferredRestarts.insert(record.id)
+        return true
+    }
+
+    /// The task of a stopped, unconfirmed attempt was found. A restart asked for meanwhile
+    /// adopts it; otherwise the stop is enforced against exactly that task.
+    private mutating func stoppedAttemptFound(_ record: IndexRecord, taskIdentifier: Int, now: Date, into outcome: inout Outcome) {
+        var record = record
+        unconfirmed[record.id] = nil
+        let binding = TaskBinding(sessionIdentifier: sessionIdentifier, taskIdentifier: taskIdentifier, generation: record.generation)
+        if deferredRestarts.remove(record.id) != nil {
+            record.phase = submissionPhase(for: record)
+            record.binding = binding
+        } else {
+            record.stoppingBinding = binding
+            outcome.effects.append(.cancelTask(record.id, taskIdentifier: taskIdentifier, producingResumeData: true))
+        }
+        save(record, now: now, into: &outcome)
+    }
+
+    /// A stopped, unconfirmed attempt provably ended without a capture. Only now does a
+    /// deferred restart create a new attempt.
+    private mutating func stoppedAttemptEnded(_ record: IndexRecord, now: Date, into outcome: inout Outcome) {
+        unconfirmed[record.id] = nil
+        if deferredRestarts.remove(record.id) != nil {
+            submit(record.id, now: now, into: &outcome)
+        }
     }
 
     private func acceptsRetry(_ record: IndexRecord) -> Bool {

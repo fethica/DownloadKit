@@ -10,6 +10,8 @@ actor InMemoryIndexStore: DownloadIndexStore {
     private(set) var applyCount = 0
     private var failWrites = false
     private var corrupt = false
+    private var holdsWrites = false
+    private var heldWrites: [CheckedContinuation<Void, Never>] = []
     private let log: CallLog?
 
     init(contents: IndexContents? = nil, log: CallLog? = nil) {
@@ -26,6 +28,19 @@ actor InMemoryIndexStore: DownloadIndexStore {
     func setFailWrites(_ fail: Bool) { failWrites = fail }
     func setCorrupt() { corrupt = true }
 
+    /// While set, every write suspends before it is applied, like a store blocked on I/O,
+    /// until the hold is lifted.
+    func setHoldWrites(_ hold: Bool) {
+        holdsWrites = hold
+        guard !hold else { return }
+        let waiting = heldWrites
+        heldWrites = []
+        for continuation in waiting { continuation.resume() }
+    }
+
+    /// Writes currently suspended by the hold.
+    var heldWriteCount: Int { heldWrites.count }
+
     func load() throws -> IndexContents? {
         if corrupt { throw DownloadError.corruptIndex }
         guard let data else { return nil }
@@ -39,6 +54,11 @@ actor InMemoryIndexStore: DownloadIndexStore {
     func apply(_ changes: IndexChangeSet) async throws {
         let ids = (changes.upserts.map(\.id.rawValue) + changes.deletions.map { "-" + $0.rawValue }).joined(separator: ",")
         await log?.append("persist \(ids)")
+        if holdsWrites {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                heldWrites.append(continuation)
+            }
+        }
         if failWrites { throw FakeError.injected }
         if let data, let header = try? Self.decoder.decode(SchemaHeader.self, from: data), header.schemaVersion > IndexSchema.currentVersion {
             throw DownloadError.unsupportedSchema(found: header.schemaVersion, supported: IndexSchema.currentVersion)
