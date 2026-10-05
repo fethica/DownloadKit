@@ -103,6 +103,15 @@ final class ModelTests: XCTestCase {
         XCTAssertEqual(RetryPolicy.default.maximumAutomaticRetries, 3)
     }
 
+    func testRetryAfterNeverShortensTheExponentialDelay() {
+        let policy = RetryPolicy(baseDelay: 100, maximumDelay: 100, maximumRetryAfter: 10)
+        XCTAssertEqual(policy.delay(forRetry: 0, jitter: 1, retryAfter: 1), 100)
+        XCTAssertEqual(policy.delay(forRetry: 0, jitter: 1, retryAfter: 50), 100, "a capped hint below the backoff changes nothing")
+        let generous = RetryPolicy(baseDelay: 2, maximumDelay: 10, maximumRetryAfter: 60)
+        XCTAssertEqual(generous.delay(forRetry: 0, jitter: 1, retryAfter: 45), 45)
+        XCTAssertEqual(generous.delay(forRetry: 0, jitter: 1, retryAfter: 600), 60)
+    }
+
     func testIndexRecordRoundTripsThroughJSONWithRelativePathsOnly() throws {
         var machine = DownloadStateMachine.fresh()
         let generation = try machine.enqueueAndBind("a", request: makeRequest("a", expectedLength: 10, policy: .anyNetwork))

@@ -18,7 +18,8 @@ public struct RetryPolicy: Hashable, Sendable {
     public var baseDelay: TimeInterval
     /// Upper bound of the exponential delay.
     public var maximumDelay: TimeInterval
-    /// Upper bound applied to a server's Retry-After.
+    /// Upper bound applied to a server's Retry-After before it is compared with the
+    /// exponential delay.
     public var maximumRetryAfter: TimeInterval
 
     public init(maximumAutomaticRetries: Int = 3, baseDelay: TimeInterval = 2, maximumDelay: TimeInterval = 300, maximumRetryAfter: TimeInterval = 3600) {
@@ -33,14 +34,14 @@ public struct RetryPolicy: Hashable, Sendable {
     /// The delay before retry number `retryIndex` (zero-based).
     ///
     /// `min(maximumDelay, baseDelay * 2^retryIndex)` scaled into `[50%, 100%]` by `jitter`
-    /// (clamped to `0...1`). A Retry-After value raises the delay to at least that value,
-    /// capped at ``maximumRetryAfter``.
+    /// (clamped to `0...1`). A Retry-After value, capped at ``maximumRetryAfter``, can only
+    /// raise that delay, never shorten it.
     public func delay(forRetry retryIndex: Int, jitter: Double, retryAfter: TimeInterval?) -> TimeInterval {
         let exponent = Double(max(0, min(retryIndex, 30)))
         let exponential = min(maximumDelay, baseDelay * pow(2, exponent))
         let clampedJitter = min(1, max(0, jitter))
         let jittered = exponential * (0.5 + 0.5 * clampedJitter)
         guard let retryAfter, retryAfter > 0 else { return jittered }
-        return min(maximumRetryAfter, max(retryAfter, jittered))
+        return max(jittered, min(maximumRetryAfter, retryAfter))
     }
 }
