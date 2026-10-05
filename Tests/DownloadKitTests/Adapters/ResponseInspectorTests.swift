@@ -59,6 +59,29 @@ final class ResponseInspectorTests: XCTestCase {
         XCTAssertEqual(verdict(evidence(206, ["Content-Range": "bytes 400-999/1000"], range: "bytes=400-", size: 600)), .restart)
     }
 
+    func testPartialContentMustContinueTheSameRepresentationAtTheKeptOffset() {
+        let range = "bytes=400-"
+        let complete = ["Content-Range": "bytes 400-999/1000"]
+        // Every case below assembles a file of exactly the full size and has no host checksum,
+        // so length checks alone would accept it.
+        // Continuation that starts elsewhere than the kept prefix ends.
+        XCTAssertEqual(verdict(evidence(206, ["Content-Range": "bytes 300-999/1000", "ETag": "\"v1\""], range: range, ifRange: "\"v1\"")), .restart)
+        // A request range this package never sends.
+        XCTAssertEqual(verdict(evidence(206, complete.merging(["ETag": "\"v1\""]) { $1 }, range: "bytes=-600", ifRange: "\"v1\"")), .fail(.invalidResponse))
+        // No validator sent, or the response omits the one that was sent.
+        XCTAssertEqual(verdict(evidence(206, complete.merging(["ETag": "\"v1\""]) { $1 }, range: range)), .restart)
+        XCTAssertEqual(verdict(evidence(206, complete, range: range, ifRange: "\"v1\"")), .restart)
+        // Weak tags never prove one representation.
+        XCTAssertEqual(verdict(evidence(206, complete.merging(["ETag": "W/\"v1\""]) { $1 }, range: range, ifRange: "W/\"v1\"")), .restart)
+        // Date validators: equal Last-Modified continues, changed or missing restarts.
+        let date = "Mon, 05 Oct 2026 10:00:00 GMT"
+        XCTAssertEqual(verdict(evidence(206, complete.merging(["Last-Modified": date]) { $1 }, range: range, ifRange: date)), .accept(ResponseValidators(lastModified: date, statusCode: 206), bytes: 1_000))
+        XCTAssertEqual(verdict(evidence(206, complete.merging(["Last-Modified": "Tue, 06 Oct 2026 10:00:00 GMT"]) { $1 }, range: range, ifRange: date)), .restart)
+        XCTAssertEqual(verdict(evidence(206, complete, range: range, ifRange: date)), .restart)
+        // A closed request range must be answered by exactly that range.
+        XCTAssertEqual(verdict(evidence(206, complete.merging(["ETag": "\"v1\""]) { $1 }, range: "bytes=400-999", ifRange: "\"v1\"")), .accept(ResponseValidators(entityTag: "\"v1\"", statusCode: 206), bytes: 1_000))
+    }
+
     func testRangeNotSatisfiable() {
         XCTAssertEqual(verdict(evidence(416, [:], range: "bytes=1000-")), .restart)
         XCTAssertEqual(verdict(evidence(416)), .fail(.http(status: 416, retryAfter: nil)))
@@ -118,6 +141,8 @@ final class ResponseInspectorTests: XCTestCase {
             (URLError(.cannotMoveFile), .storage(.other)),
             (URLError(.badServerResponse), .invalidResponse),
             (URLError(.serverCertificateUntrusted), .unknown),
+            (URLError(.dataNotAllowed), .policyBlocked),
+            (URLError(.noPermissionsToReadFile), .storage(.permissionDenied)),
             (NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES)), .storage(.permissionDenied)),
             (NSError(domain: "elsewhere", code: 1), .unknown),
         ]
@@ -125,6 +150,11 @@ final class ResponseInspectorTests: XCTestCase {
             XCTAssertEqual(TransferErrorClassifier.classify(error), expected, "\(error)")
         }
         XCTAssertEqual(TransferErrorClassifier.classify(policy).classification, .policyWait)
+        // A disallowed cellular connection waits and spends no retry; a read permission failure
+        // is a storage failure, not a malformed response.
+        XCTAssertEqual(TransferErrorClassifier.classify(URLError(.dataNotAllowed)).classification, .policyWait)
+        XCTAssertEqual(TransferErrorClassifier.classify(URLError(.noPermissionsToReadFile)).classification, .storage)
+        XCTAssertEqual(TransferErrorClassifier.classify(URLError(.noPermissionsToReadFile)).downloadFailure, DownloadFailure(kind: .storage))
     }
 
     func testStoredEventsRoundTripEveryTerminalShape() throws {

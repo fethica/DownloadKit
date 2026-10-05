@@ -155,6 +155,33 @@ final class LocalFileSystemTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: staging.path), "the source is kept")
     }
 
+    func testFailedDirectoryFlushAfterARenameIsReportedNotHidden() async throws {
+        let staging = base.appendingPathComponent("ns/staging/a")
+        try writeFile(staging, mediaBytes(30))
+        // Writable and searchable but not readable: the rename succeeds, opening the directory
+        // to flush it fails.
+        let media = base.appendingPathComponent("ns/media")
+        try FileManager.default.createDirectory(at: media, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o300], ofItemAtPath: media.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: media.path) }
+
+        do {
+            try await fileSystem.moveItem(at: staging, to: media.appendingPathComponent("item-1"))
+            XCTFail("a failed directory flush was reported as success")
+        } catch let error as DownloadFileSystemError {
+            XCTAssertEqual(error.kind, .directoryFlushFailed)
+        }
+        do {
+            try await fileSystem.synchronizeDirectory(at: media)
+            XCTFail("a failed directory flush was reported as success")
+        } catch let error as DownloadFileSystemError {
+            XCTAssertEqual(error.kind, .directoryFlushFailed)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: media.path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: media.appendingPathComponent("item-1").path), "the renamed file is in place")
+        try await fileSystem.synchronizeDirectory(at: media)
+    }
+
     func testErrorClassification() {
         let cases: [(any Error, DownloadFileSystemError.Kind)] = [
             (NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError), .diskFull),

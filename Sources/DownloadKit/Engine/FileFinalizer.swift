@@ -21,7 +21,8 @@ import Foundation
 ///
 /// Repeatable: when the file in staging is gone and the destination holds a file, that file is
 /// validated again and reported as finalised, which recovers an interruption between rename
-/// and commit. Before each step, and between hash chunks, it checks cancellation and the
+/// and commit; its directories are flushed again first, so a rename whose directory flush failed
+/// is reported only once it is durable (a failed flush defers). Before each step, and between hash chunks, it checks cancellation and the
 /// request's deadline and returns ``FinalizationResult/deferred`` instead of running on; the
 /// capture then stays for a later attempt. A file that is protected while the device is locked
 /// also defers. Other storage errors fail with their reason.
@@ -50,6 +51,11 @@ struct FileFinalizer: DownloadFinalizing {
                     return .failed(.storage(.other))
                 }
                 if let outcome = try await validate(destination, size: size, request) { return outcome }
+                // The rename may have happened in an attempt whose directory flush failed (or
+                // was interrupted): establish durability again before reporting success.
+                try await fileSystem.synchronizeDirectory(at: destination.deletingLastPathComponent())
+                try await fileSystem.synchronizeDirectory(at: staging.deletingLastPathComponent())
+                guard await canContinue(request) else { return .deferred }
                 return .finalized(finalPath: request.destination, integrity: IntegrityRecord(verifiedLength: size, checksum: request.checksum))
             }
         } catch {
@@ -87,7 +93,9 @@ struct FileFinalizer: DownloadFinalizing {
 
     private static func result(for error: any Error) -> FinalizationResult {
         guard let failure = error as? DownloadFileSystemError else { return .failed(.storage(.other)) }
-        if failure.kind == .fileProtection { return .deferred }
+        // A protected file, or a renamed file whose directory flush failed, keeps its capture
+        // for a later attempt: neither is a reason to reject the bytes.
+        if failure.kind == .fileProtection || failure.kind == .directoryFlushFailed { return .deferred }
         return .failed(.storage(failure.storageReason))
     }
 }

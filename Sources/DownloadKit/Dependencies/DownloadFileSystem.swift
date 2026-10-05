@@ -45,6 +45,18 @@ public protocol DownloadFileSystem: Sendable {
     func synchronizeFile(at url: URL) async throws
     /// Removes a file; succeeds when nothing exists at `url`.
     func removeItem(at url: URL) async throws
-    /// Atomically renames within one volume.
+    /// Atomically renames within one volume. Throws after the rename when the directory
+    /// change could not be made durable (``LocalFileSystem`` throws
+    /// ``DownloadFileSystemError/Kind/directoryFlushFailed``); callers then treat the renamed
+    /// file as present but not yet durable.
     func moveItem(at source: URL, to destination: URL) async throws
+    /// Flushes a directory's entries to stable storage, so an earlier rename into it survives a
+    /// power loss. The finaliser calls it again when it recovers an already renamed file.
+    func synchronizeDirectory(at url: URL) async throws
+}
+
+extension DownloadFileSystem {
+    /// Default for file systems without a directory flush: does nothing. Adapters that can
+    /// flush directories should implement it.
+    public func synchronizeDirectory(at url: URL) async throws {}
 }

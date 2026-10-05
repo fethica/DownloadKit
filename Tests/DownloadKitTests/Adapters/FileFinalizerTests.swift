@@ -157,6 +157,28 @@ final class FileFinalizerTests: XCTestCase {
         }
     }
 
+    func testFailedDirectoryFlushAfterTheRenameDefersAndIsRetriedBeforeSuccess() async throws {
+        try placeCapture()
+        let faulty = FaultyFileSystem(base: fileSystem)
+        await faulty.fail(.flushDirectory, with: .directoryFlushFailed)
+
+        // The rename happened, its directory flush failed: not finalised, and not rejected.
+        let first = await finalizer(faulty).finalize(request())
+        XCTAssertEqual(first, .deferred)
+        XCTAssertFalse(captureExists)
+        XCTAssertTrue(destinationExists, "the validated bytes are kept in place")
+
+        // Recovery of the renamed file flushes again; while that still fails it defers.
+        let still = await finalizer(faulty).finalize(request())
+        XCTAssertEqual(still, .deferred)
+
+        await faulty.fail(.flushDirectory, with: nil)
+        let recovered = await finalizer(faulty).finalize(request())
+        XCTAssertEqual(recovered, .finalized(finalPath: path("media/item-2.mp3"), integrity: IntegrityRecord(verifiedLength: Int64(content.count))))
+        let calls = await faulty.calls
+        XCTAssertEqual(calls.filter { $0 == .flushDirectory }.count, 4, "one failed flush per failed attempt, then both directories")
+    }
+
     func testFinalNamesUseAllowlistedExtensionsOnly() {
         let source = URL(string: "https://media.example.com/a/episode.M4A?sig=1")!
         XCTAssertEqual(MediaFileExtension.infer(mediaType: "audio/mpeg", sourceURL: source), "mp3")

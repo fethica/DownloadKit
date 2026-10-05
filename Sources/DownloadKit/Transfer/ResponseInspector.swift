@@ -44,10 +44,12 @@ enum ResponseVerdict: Sendable, Equatable {
 /// - 200 is a complete representation, whether or not a range was asked for (a server that
 ///   ignores a range sends the whole file; it is never appended to earlier bytes). A declared
 ///   `Content-Length` must match the file, otherwise the body was truncated (transient).
-/// - 206 is accepted only for a request that asked for a range, with a `Content-Range` that ends
-///   at the last byte of the representation, an entity tag matching the `If-Range` sent, and a
-///   file that holds the whole representation. An unsolicited 206 is an invalid response; a
-///   mismatch on a continuation restarts from zero.
+/// - 206 is accepted only for a request that asked for a single range `bytes=<start>-`, with a
+///   `Content-Range` that starts at that offset and ends at the last byte of the representation,
+///   a file that holds the whole representation, and an `If-Range` validator the response
+///   confirms (a strong entity tag equal to its `ETag`, or a date equal to its `Last-Modified`).
+///   An unsolicited or malformed 206 is an invalid response; anything else on a continuation
+///   (another offset, a missing or changed validator, a weak tag) restarts from zero.
 /// - 416 on a continuation restarts from zero; without a range it is an HTTP failure.
 /// - Any other status fails with its code and parsed `Retry-After`.
 /// - An empty body, an HTML media type or a body that starts like an HTML document is not
@@ -66,15 +68,20 @@ struct ResponseInspector: Sendable {
                 return .fail(.network(code: URLError.networkConnectionLost.rawValue))
             }
         case 206:
-            guard evidence.requestRange != nil,
+            guard let requested = evidence.requestRange.flatMap(Self.parseRequestRange),
                   let range = evidence.header("content-range").flatMap(Self.parseContentRange) else {
                 return .fail(.invalidResponse)
             }
-            if let ifRange = evidence.requestIfRange, Self.isEntityTag(ifRange),
-               let entityTag = evidence.header("etag"), entityTag != ifRange {
+            // One representation: the continuation starts exactly where the kept prefix ends,
+            // runs to the last byte, the assembled file holds all of it, and the validator the
+            // request sent proves the server still has the representation the prefix came from.
+            guard range.start == requested.start,
+                  requested.end.map({ $0 == range.end }) ?? true,
+                  range.end == range.total - 1,
+                  evidence.fileSize == range.total,
+                  Self.validatorMatches(ifRange: evidence.requestIfRange, entityTag: evidence.header("etag"), lastModified: evidence.header("last-modified")) else {
                 return .restart
             }
-            guard range.end == range.total - 1, evidence.fileSize == range.total else { return .restart }
         case 416:
             return evidence.requestRange != nil ? .restart : .fail(.http(status: status, retryAfter: nil))
         case 200..<300:
@@ -108,6 +115,33 @@ struct ResponseInspector: Sendable {
         bytes = bytes.drop { $0 == 0x20 || $0 == 0x09 || $0 == 0x0A || $0 == 0x0D }
         let head = String(decoding: bytes.prefix(32), as: UTF8.self).lowercased()
         return ["<!doctype html", "<html", "<head", "<body"].contains { head.hasPrefix($0) }
+    }
+
+    /// A request `Range` of the single form `bytes=<start>-` or `bytes=<start>-<end>`. Suffix
+    /// ranges and multiple ranges are never sent by a continuation and are not accepted.
+    static func parseRequestRange(_ value: String) -> (start: Int64, end: Int64?)? {
+        let trimmed = value.trimmingCharacters(in: .whitespaces)
+        guard trimmed.lowercased().hasPrefix("bytes="), !trimmed.contains(",") else { return nil }
+        let bounds = trimmed.dropFirst("bytes=".count).split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard bounds.count == 2, let start = Int64(bounds[0].trimmingCharacters(in: .whitespaces)), start >= 0 else { return nil }
+        let endText = bounds[1].trimmingCharacters(in: .whitespaces)
+        if endText.isEmpty { return (start, nil) }
+        guard let end = Int64(endText), end >= start else { return nil }
+        return (start, end)
+    }
+
+    /// Whether the `If-Range` validator the continuation sent still names the response's
+    /// representation: a strong entity tag equal to the response's `ETag`, or an HTTP date
+    /// equal to the response's `Last-Modified`. A missing validator on either side, or a weak
+    /// tag (which RFC 9110 does not allow for ranges), is not proof.
+    static func validatorMatches(ifRange: String?, entityTag: String?, lastModified: String?) -> Bool {
+        guard let ifRange = ifRange?.trimmingCharacters(in: .whitespaces), !ifRange.isEmpty else { return false }
+        if isEntityTag(ifRange) {
+            guard !ifRange.hasPrefix("W/"), let entityTag, !entityTag.hasPrefix("W/") else { return false }
+            return entityTag == ifRange
+        }
+        guard let sent = httpDate(ifRange), let lastModified, let current = httpDate(lastModified) else { return false }
+        return sent == current
     }
 
     /// `bytes <start>-<end>/<total>` with a known total.
@@ -160,7 +194,8 @@ struct ResponseInspector: Sendable {
 /// Maps a task's completion error to a typed transfer failure.
 ///
 /// Network loss, timeouts and unreachable hosts are transient; a request refused because the
-/// network is cellular, expensive or constrained is a policy wait; authentication problems are
+/// network is cellular, expensive or constrained (including a disallowed cellular data
+/// connection) is a policy wait; a file the process may not read is a permission failure; authentication problems are
 /// authentication failures; file errors are storage failures with their reason; malformed
 /// responses are invalid responses; certificate and transport-security failures are permanent.
 enum TransferErrorClassifier {
@@ -181,11 +216,16 @@ enum TransferErrorClassifier {
             if (error as? URLError)?.networkUnavailableReason != nil { return .policyBlocked }
             return .network(code: nsError.code)
         case .timedOut, .networkConnectionLost, .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
-             .internationalRoamingOff, .callIsActive, .dataNotAllowed, .secureConnectionFailed,
+             .internationalRoamingOff, .callIsActive, .secureConnectionFailed,
              .backgroundSessionWasDisconnected, .cannotLoadFromNetwork, .resourceUnavailable:
             return .network(code: nsError.code)
+        case .dataNotAllowed:
+            // The system refused to use the cellular connection: a policy wait, never a retry.
+            return .policyBlocked
         case .userAuthenticationRequired, .userCancelledAuthentication:
             return .credentialsUnavailable
+        case .noPermissionsToReadFile:
+            return .storage(.permissionDenied)
         case .cannotCreateFile, .cannotOpenFile, .cannotCloseFile, .cannotWriteToFile, .cannotRemoveFile, .cannotMoveFile:
             if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
                 let storage = DownloadFileSystemError(underlying)
@@ -194,7 +234,7 @@ enum TransferErrorClassifier {
             return .storage(.other)
         case .badServerResponse, .cannotDecodeRawData, .cannotDecodeContentData, .cannotParseResponse,
              .zeroByteResource, .dataLengthExceedsMaximum, .httpTooManyRedirects, .redirectToNonExistentLocation,
-             .badURL, .unsupportedURL, .fileDoesNotExist, .fileIsDirectory, .noPermissionsToReadFile:
+             .badURL, .unsupportedURL, .fileDoesNotExist, .fileIsDirectory:
             return .invalidResponse
         case .serverCertificateHasBadDate, .serverCertificateUntrusted, .serverCertificateHasUnknownRoot,
              .serverCertificateNotYetValid, .clientCertificateRejected, .clientCertificateRequired,

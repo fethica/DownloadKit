@@ -16,7 +16,9 @@ import Foundation
 /// - ``inspectItem(at:)`` returns ``FileStatus/absent`` only when the file system reports that
 ///   nothing exists; a failed inspection throws.
 /// - ``moveItem(at:to:)`` is one POSIX `rename`, atomic within a volume and replacing the
-///   destination, followed by a flush of the destination directory. Across volumes it throws
+///   destination, followed by a flush of the destination and the source directory. A flush that
+///   fails throws ``DownloadFileSystemError/Kind/directoryFlushFailed`` after the rename (the
+///   file is in place, its durability is not established). Across volumes it throws
 ///   ``DownloadFileSystemError/Kind/crossVolume``.
 /// - Directories the manager creates get the configured file protection on platforms that
 ///   support it. The default, complete until first user authentication, keeps files readable
@@ -123,7 +125,17 @@ public struct LocalFileSystem: DownloadFileSystem {
         guard rename(from.path, to.path) == 0 else {
             throw DownloadFileSystemError(posixCode: errno)
         }
-        Self.synchronizeDirectory(to.deletingLastPathComponent())
+        // The rename is visible now; it is durable only once both directory entries are.
+        let destinationDirectory = to.deletingLastPathComponent()
+        let sourceDirectory = from.deletingLastPathComponent()
+        try Self.synchronizeDirectory(destinationDirectory)
+        if sourceDirectory.path != destinationDirectory.path {
+            try Self.synchronizeDirectory(sourceDirectory)
+        }
+    }
+
+    public func synchronizeDirectory(at url: URL) async throws {
+        try Self.synchronizeDirectory(try confined(url))
     }
 
     // MARK: Confinement
@@ -140,23 +152,10 @@ public struct LocalFileSystem: DownloadFileSystem {
         }.standardizedFileURL
     }
 
-    /// `url` resolved against `.` and `..`, inside the base, with no symbolic link below it.
+    /// `url` resolved against `.` and `..`, inside the base, with no symbolic link below it
+    /// (the shared ``PathConfinement`` rule).
     func confined(_ url: URL) throws -> URL {
-        let base = try base(creating: false)
-        let target = url.standardizedFileURL
-        let basePath = base.path.hasSuffix("/") ? String(base.path.dropLast()) : base.path
-        guard target.isFileURL, target.path == basePath || target.path.hasPrefix(basePath + "/") else {
-            throw DownloadFileSystemError(kind: .escapesRoot)
-        }
-        var current = basePath
-        for component in target.path.dropFirst(basePath.count).split(separator: "/") {
-            current += "/" + component
-            guard let attributes = try? FileManager.default.attributesOfItem(atPath: current) else { break }
-            if attributes[.type] as? FileAttributeType == .typeSymbolicLink {
-                throw DownloadFileSystemError(kind: .escapesRoot)
-            }
-        }
-        return target
+        try PathConfinement.confined(url, within: try base(creating: false))
     }
 
     private func classified<T>(_ body: () throws -> T) throws -> T {
@@ -169,12 +168,18 @@ public struct LocalFileSystem: DownloadFileSystem {
         }
     }
 
-    /// Flushes a directory entry change (a rename) to stable storage. Best effort.
-    private static func synchronizeDirectory(_ directory: URL) {
-        let descriptor = open(directory.path, O_RDONLY)
-        guard descriptor >= 0 else { return }
-        _ = fsync(descriptor)
-        _ = close(descriptor)
+    /// Flushes a directory entry change (a rename) to stable storage. A directory that cannot be
+    /// opened or flushed throws ``DownloadFileSystemError/Kind/directoryFlushFailed``: the change
+    /// is visible but its durability is not established.
+    private static func synchronizeDirectory(_ directory: URL) throws {
+        let descriptor = open(directory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw DownloadFileSystemError(kind: .directoryFlushFailed, code: Int(errno))
+        }
+        defer { _ = close(descriptor) }
+        guard fsync(descriptor) == 0 else {
+            throw DownloadFileSystemError(kind: .directoryFlushFailed, code: Int(errno))
+        }
     }
 }
 
@@ -196,6 +201,9 @@ public struct DownloadFileSystemError: Error, Hashable, Sendable {
         case crossVolume
         /// Nothing exists at the path.
         case notFound
+        /// A directory entry change (a rename) happened but flushing the directory failed, so
+        /// the change may not survive a power loss. The renamed file is in place.
+        case directoryFlushFailed
         case other
     }
 
@@ -253,7 +261,7 @@ public struct DownloadFileSystemError: Error, Hashable, Sendable {
         case .diskFull: return .diskFull
         case .permissionDenied: return .permissionDenied
         case .fileProtection: return .fileProtection
-        case .escapesRoot, .notARegularFile, .crossVolume, .notFound, .other: return .other
+        case .escapesRoot, .notARegularFile, .crossVolume, .notFound, .directoryFlushFailed, .other: return .other
         }
     }
 }

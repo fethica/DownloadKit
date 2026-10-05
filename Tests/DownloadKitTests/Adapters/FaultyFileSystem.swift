@@ -6,6 +6,8 @@ import Foundation
 actor FaultyFileSystem: DownloadFileSystem {
     enum Operation: Hashable {
         case inspect, read, synchronize, move, remove, list
+        /// A directory flush: after a rename (the rename itself happens) or on its own.
+        case flushDirectory
     }
 
     private let base: LocalFileSystem
@@ -57,6 +59,15 @@ actor FaultyFileSystem: DownloadFileSystem {
     func moveItem(at source: URL, to destination: URL) async throws {
         try check(.move)
         try await base.moveItem(at: source, to: destination)
+        if let fault = faults[.flushDirectory] {
+            calls.append(.flushDirectory)
+            throw fault
+        }
+    }
+
+    func synchronizeDirectory(at url: URL) async throws {
+        try check(.flushDirectory)
+        try await base.synchronizeDirectory(at: url)
     }
 }
 
