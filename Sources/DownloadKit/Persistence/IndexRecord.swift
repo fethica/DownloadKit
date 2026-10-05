@@ -24,7 +24,8 @@ public enum IndexSchema {
 /// - presentation: ``metadata`` and the optional per-item ``policy``;
 /// - state: ``phase``, ``generation`` (attempt generation), ``automaticRetryCount`` and
 ///   ``retryAt`` (retry eligibility and time);
-/// - transfer binding: ``binding`` (session identifier, task identifier, generation);
+/// - transfer binding: ``binding`` (session identifier, task identifier, generation) and
+///   ``stoppingBinding`` (a task the manager asked to stop and has not seen acknowledged);
 /// - bytes and validators: ``bytesWritten``, ``expectedBytes``, ``validators``,
 ///   ``resumeDataPath``;
 /// - finalisation: ``journal``, ``stagingPath``, ``finalPath``, ``integrity``.
@@ -32,9 +33,12 @@ public enum IndexSchema {
 /// Generations are allocated from one counter per index and never reused, so an event that
 /// carries an older generation can never match a removed, replaced or re-enqueued item.
 ///
-/// Secrets: request headers and credentials are never stored. The source URL is stored as
-/// given; hosts that use signed URLs should provide a ``URLRefreshing`` instead of long-lived
-/// tokens.
+/// Secrets: request headers are never stored, and source URLs carrying a user or password
+/// are rejected. The source URL, including its query, is stored as given; see
+/// ``URLRefreshing`` for keeping signed query credentials out of the index.
+///
+/// External stores rebuild records with ``init(id:request:metadata:policy:phase:generation:automaticRetryCount:retryAt:binding:stoppingBinding:bytesWritten:expectedBytes:validators:integrity:journal:stagingPath:finalPath:resumeDataPath:createdAt:updatedAt:)``
+/// or store them as opaque `Codable` values.
 public struct IndexRecord: Hashable, Sendable, Codable {
     public internal(set) var id: DownloadID
     public internal(set) var request: RequestIdentity
@@ -45,6 +49,10 @@ public struct IndexRecord: Hashable, Sendable, Codable {
     public internal(set) var automaticRetryCount: Int
     public internal(set) var retryAt: Date?
     public internal(set) var binding: TaskBinding?
+    /// The task of an earlier attempt that pause, cancel or remove asked to stop. It is kept
+    /// until the session accepted the cancellation or reconciliation found the task gone, so a
+    /// stop interrupted by process exit is enforced again on the next start.
+    public internal(set) var stoppingBinding: TaskBinding?
     public internal(set) var bytesWritten: Int64
     public internal(set) var expectedBytes: Int64?
     public internal(set) var validators: ResponseValidators?
@@ -57,6 +65,90 @@ public struct IndexRecord: Hashable, Sendable, Codable {
     public internal(set) var resumeDataPath: RelativePath?
     public internal(set) var createdAt: Date
     public internal(set) var updatedAt: Date
+
+    /// Rebuilds a record from stored fields, for index stores outside this module.
+    ///
+    /// Throws ``DownloadError/invalidStoredRecord(_:)`` when the fields contradict each
+    /// other: a binding newer than the record's generation, a completed record without a final
+    /// path, or a captured journal without a staging path.
+    public init(
+        id: DownloadID,
+        request: RequestIdentity,
+        metadata: DownloadMetadata,
+        policy: NetworkPolicy?,
+        phase: RecordPhase,
+        generation: UInt64,
+        automaticRetryCount: Int,
+        retryAt: Date?,
+        binding: TaskBinding?,
+        stoppingBinding: TaskBinding?,
+        bytesWritten: Int64,
+        expectedBytes: Int64?,
+        validators: ResponseValidators?,
+        integrity: IntegrityRecord?,
+        journal: FinalizationJournal,
+        stagingPath: RelativePath?,
+        finalPath: RelativePath?,
+        resumeDataPath: RelativePath?,
+        createdAt: Date,
+        updatedAt: Date
+    ) throws {
+        if let binding, binding.generation > generation { throw DownloadError.invalidStoredRecord(id) }
+        if case .completed = phase, finalPath == nil { throw DownloadError.invalidStoredRecord(id) }
+        if journal == .captured, stagingPath == nil { throw DownloadError.invalidStoredRecord(id) }
+        self.init(
+            unchecked: id, request: request, metadata: metadata, policy: policy, phase: phase,
+            generation: generation, automaticRetryCount: max(0, automaticRetryCount), retryAt: retryAt,
+            binding: binding, stoppingBinding: stoppingBinding, bytesWritten: max(0, bytesWritten),
+            expectedBytes: expectedBytes, validators: validators, integrity: integrity, journal: journal,
+            stagingPath: stagingPath, finalPath: finalPath, resumeDataPath: resumeDataPath,
+            createdAt: createdAt, updatedAt: updatedAt
+        )
+    }
+
+    init(
+        unchecked id: DownloadID,
+        request: RequestIdentity,
+        metadata: DownloadMetadata,
+        policy: NetworkPolicy?,
+        phase: RecordPhase,
+        generation: UInt64,
+        automaticRetryCount: Int,
+        retryAt: Date?,
+        binding: TaskBinding?,
+        stoppingBinding: TaskBinding?,
+        bytesWritten: Int64,
+        expectedBytes: Int64?,
+        validators: ResponseValidators?,
+        integrity: IntegrityRecord?,
+        journal: FinalizationJournal,
+        stagingPath: RelativePath?,
+        finalPath: RelativePath?,
+        resumeDataPath: RelativePath?,
+        createdAt: Date,
+        updatedAt: Date
+    ) {
+        self.id = id
+        self.request = request
+        self.metadata = metadata
+        self.policy = policy
+        self.phase = phase
+        self.generation = generation
+        self.automaticRetryCount = automaticRetryCount
+        self.retryAt = retryAt
+        self.binding = binding
+        self.stoppingBinding = stoppingBinding
+        self.bytesWritten = bytesWritten
+        self.expectedBytes = expectedBytes
+        self.validators = validators
+        self.integrity = integrity
+        self.journal = journal
+        self.stagingPath = stagingPath
+        self.finalPath = finalPath
+        self.resumeDataPath = resumeDataPath
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
 
     /// The content revision of the item.
     public var revision: ContentRevision { request.revision }
@@ -114,6 +206,14 @@ public struct RequestIdentity: Hashable, Sendable, Codable {
         checksum = request.checksum
     }
 
+    /// Rebuilds a stored request identity, for index stores outside this module.
+    public init(sourceURL: URL, revision: ContentRevision, expectedLength: Int64?, checksum: ContentChecksum?) {
+        self.sourceURL = sourceURL
+        self.revision = revision
+        self.expectedLength = expectedLength
+        self.checksum = checksum
+    }
+
     func hasSameContent(as other: RequestIdentity) -> Bool {
         revision == other.revision && expectedLength == other.expectedLength && checksum == other.checksum
     }
@@ -127,6 +227,12 @@ public struct TaskBinding: Hashable, Sendable, Codable {
     public let sessionIdentifier: String
     public let taskIdentifier: Int
     public let generation: UInt64
+
+    public init(sessionIdentifier: String, taskIdentifier: Int, generation: UInt64) {
+        self.sessionIdentifier = sessionIdentifier
+        self.taskIdentifier = taskIdentifier
+        self.generation = generation
+    }
 }
 
 /// HTTP validators of the response that produced the bytes.
@@ -155,21 +261,25 @@ public struct IntegrityRecord: Hashable, Sendable, Codable {
 
 /// The finalisation journal of a record.
 ///
-/// Finalisation order (each step is persisted before the next starts):
+/// Finalisation order:
 /// 1. ``captured``: the downloaded temporary file was moved into `staging/` before the system
-///    callback returned.
-/// 2. ``validated``: HTTP status, media type, length and checksum checks passed.
-/// 3. ``renamed``: the captured file was flushed and atomically renamed into `media/`.
-/// 4. ``committed``: the completed record was committed; only now is the item completed.
+///    callback returned, and the capture (path, byte count, validators) is committed with the
+///    record. Until that commit the transfer session keeps the unacknowledged event and
+///    delivers it again after a relaunch, so the capture never loses its association.
+/// 2. The finaliser validates length and checksum, flushes the file and renames it to the
+///    deterministic destination ``RelativePath`` `media/item-<generation>`. These steps are
+///    not journaled separately: they are idempotent, and a finaliser that finds the staging
+///    file gone and a valid file at the destination reports it as finalised.
+/// 3. ``committed``: the completed record was committed; only now is the item completed.
 ///
-/// Start-up recovery rule: `captured` or `validated` are validated again; `renamed` checks the
-/// final file and commits it; a committed record whose file is missing becomes
-/// ``RecordPhase/missing``. A file rename and an index transaction are not one atomic
-/// operation, so both interruption windows are recoverable from this journal.
+/// Start-up recovery rule: an active record whose journal is `captured` is finalised again
+/// for the same generation, which covers an interruption before validation, between rename
+/// and commit, and a deferred finalisation. A committed record whose file is verifiably absent
+/// becomes ``RecordPhase/missing``. A completed file that replaces an older one never
+/// overwrites it, because each generation has its own destination; the older file is
+/// deleted only after the newer record commits.
 public enum FinalizationJournal: String, Hashable, Sendable, Codable {
     case notStarted
     case captured
-    case validated
-    case renamed
     case committed
 }

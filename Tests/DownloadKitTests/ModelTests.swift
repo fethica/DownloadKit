@@ -112,6 +112,15 @@ final class ModelTests: XCTestCase {
         XCTAssertEqual(generous.delay(forRetry: 0, jitter: 1, retryAfter: 600), 60)
     }
 
+    func testTaskDescriptionMapsBackToItemAndGeneration() throws {
+        let submission = TransferSubmission(itemID: itemID("series/episode 7"), generation: 42, url: URL(string: "https://media.example.com/a")!, policy: .default, resumeDataPath: nil, expectedLength: nil)
+        let mapped = TransferTaskReference(taskDescription: submission.taskDescription, taskIdentifier: 9)
+        XCTAssertEqual(mapped, TransferTaskReference(itemID: itemID("series/episode 7"), generation: 42, taskIdentifier: 9))
+        XCTAssertNil(TransferTaskReference(taskDescription: "some other task", taskIdentifier: 1))
+        XCTAssertNil(TransferTaskReference(taskDescription: nil, taskIdentifier: 1))
+        XCTAssertNil(TransferTaskReference(taskDescription: "downloadkit/1/x/a", taskIdentifier: 1))
+    }
+
     func testIndexRecordRoundTripsThroughJSONWithRelativePathsOnly() throws {
         var machine = DownloadStateMachine.fresh()
         let generation = try machine.enqueueAndBind("a", request: makeRequest("a", expectedLength: 10, policy: .anyNetwork))

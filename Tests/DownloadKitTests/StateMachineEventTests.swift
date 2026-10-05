@@ -151,15 +151,22 @@ final class StateMachineEventTests: XCTestCase {
         XCTAssertEqual(machine.record("a")?.stagingPath, path("staging/one"))
     }
 
-    func testFinishedAfterCancelIsDiscarded() throws {
+    func testFinishedAfterCancelRetainsTheCaptureWithoutCompleting() throws {
         var machine = DownloadStateMachine.fresh()
         let generation = try machine.enqueueAndBind("a")
         _ = try machine.handle(.cancel(itemID("a")), now: referenceDate)
 
         let outcome = machine.send(.finished(reference("a", generation: generation), captured: path("staging/a"), bytes: 10, validators: nil))
 
-        XCTAssertEqual(outcome.effects, [.discardFile(path("staging/a"))])
+        XCTAssertTrue(outcome.effects.isEmpty, "the bytes are neither deleted nor finalised")
         XCTAssertEqual(machine.phase("a"), .failed(DownloadFailure(kind: .cancelled)))
+        XCTAssertEqual(machine.record("a")?.journal, .captured)
+        XCTAssertEqual(machine.record("a")?.ownedPaths, [path("staging/a")])
+
+        let retry = try machine.handle(.retry(itemID("a")), now: referenceDate)
+
+        XCTAssertEqual(retry.effects, [.finalize(itemID("a"), generation: generation, captured: path("staging/a"))])
+        XCTAssertEqual(machine.generation("a"), generation, "the capture keeps its generation")
     }
 
     func testFinishedWhilePausedKeepsTheCompletedBytes() throws {
@@ -361,7 +368,7 @@ final class StateMachineEventTests: XCTestCase {
         var machine = DownloadStateMachine.fresh()
         let generation = try machine.enqueueAndBind("a")
 
-        let outcome = machine.handle(.orphanedIntent(itemID("a")), now: referenceDate, jitter: 0)
+        let outcome = machine.handle(.orphanedIntent(itemID("a"), generation: generation), now: referenceDate, jitter: 0)
 
         XCTAssertEqual(outcome.submissions.count, 1)
         XCTAssertGreaterThan(machine.generation("a"), generation)
@@ -372,7 +379,7 @@ final class StateMachineEventTests: XCTestCase {
         let generation = try machine.enqueueAndBind("a")
         _ = machine.send(.finished(reference("a", generation: generation), captured: path("staging/a"), bytes: 10, validators: nil))
 
-        let outcome = machine.handle(.orphanedIntent(itemID("a")), now: referenceDate, jitter: 0)
+        let outcome = machine.handle(.orphanedIntent(itemID("a"), generation: generation), now: referenceDate, jitter: 0)
 
         XCTAssertTrue(outcome.effects.isEmpty)
         XCTAssertEqual(machine.record("a")?.journal, .captured)

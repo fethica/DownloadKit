@@ -17,7 +17,10 @@ import Foundation
 /// 3. Send commands. Every command and every transfer event is applied in arrival order, one
 ///    at a time: the index is written before in-memory state changes and before any transfer
 ///    is started or cancelled.
-/// 4. ``detach()`` releases the in-process owner without cancelling transfers.
+/// 4. Forward the app delegate's background-session wake to
+///    ``handleBackgroundEvents(forSession:completionHandler:)``. It may be called before
+///    ``start()`` finishes.
+/// 5. ``detach()`` releases the in-process owner without cancelling transfers.
 ///
 /// Releasing a view or ending a snapshot subscription never affects transfers.
 ///
@@ -32,6 +35,7 @@ import Foundation
 public final class DownloadManager: Sendable {
     public let configuration: DownloadConfiguration
     let engine: DownloadEngine
+    private let backgroundEvents: BackgroundEventsCoordinator
 
     public convenience init(configuration: DownloadConfiguration, urlRefresher: (any URLRefreshing)? = nil) {
         self.init(configuration: configuration, urlRefresher: urlRefresher, finalizer: DeferredFinalizer())
@@ -39,7 +43,9 @@ public final class DownloadManager: Sendable {
 
     init(configuration: DownloadConfiguration, urlRefresher: (any URLRefreshing)?, finalizer: any DownloadFinalizing) {
         self.configuration = configuration
-        self.engine = DownloadEngine(configuration: configuration, urlRefresher: urlRefresher, finalizer: finalizer)
+        let backgroundEvents = BackgroundEventsCoordinator()
+        self.backgroundEvents = backgroundEvents
+        self.engine = DownloadEngine(configuration: configuration, urlRefresher: urlRefresher, finalizer: finalizer, backgroundEvents: backgroundEvents)
     }
 
     // MARK: Lifecycle
@@ -54,10 +60,41 @@ public final class DownloadManager: Sendable {
         try await engine.start()
     }
 
-    /// Releases the in-process owner: stops observing events, ends snapshot streams and frees
-    /// the storage claim. Transfers already handed to the system are not cancelled.
+    /// Releases the in-process owner: stops observing events and ends snapshot streams.
+    /// Transfers already handed to the system are not cancelled, and session events not yet
+    /// applied stay with the session for the next owner.
+    ///
+    /// The storage claim is freed immediately when no ``LocalFileLease`` is outstanding.
+    /// Otherwise it is kept until the last lease ends, so another manager cannot take over the
+    /// root and delete a file that is still leased. A detached manager never deletes files; the
+    /// next owner finishes pending removals when it starts.
     public func detach() async {
         await engine.detach()
+    }
+
+    /// Accepts the host's background-session wake.
+    ///
+    /// Call it from `application(_:handleEventsForBackgroundURLSession:completionHandler:)`.
+    /// Returns `false`, without keeping the handler, when `identifier` is not this manager's
+    /// session identifier; the host stays responsible for it. Otherwise the handler is kept
+    /// (even before ``start()`` finished) and called exactly once on the main actor after the
+    /// manager has applied every event the system delivered for the wake.
+    @MainActor
+    @discardableResult
+    public func handleBackgroundEvents(forSession identifier: String, completionHandler: @escaping () -> Void) -> Bool {
+        guard identifier == configuration.sessionIdentifier else { return false }
+        backgroundEvents.register(completionHandler)
+        return true
+    }
+
+    /// Retries work that is waiting for the index: terminal transfer events and internal
+    /// follow-ups whose write was rejected, and file deletions of removed items. The same retry
+    /// also runs at the start of every later command.
+    ///
+    /// Throws ``DownloadError/persistenceFailed`` while events are still waiting for an index
+    /// write. A file deletion that keeps failing leaves the item `removing`.
+    public func flushPendingWork() async throws {
+        try await engine.flushPendingWork()
     }
 
     // MARK: Commands
@@ -137,21 +174,25 @@ public final class DownloadManager: Sendable {
 
     /// A stream of every item's snapshot, oldest item first.
     ///
-    /// The stream yields the current list immediately, then at most once per
-    /// ``DownloadConfiguration/snapshotInterval``. It buffers only the newest list, so a slow
-    /// consumer skips intermediate lists instead of growing memory. Ending the iteration
-    /// unsubscribes and never affects transfers.
-    public func snapshots() async -> AsyncStream<[DownloadSnapshot]> {
-        await engine.subscribe()
+    /// Each iteration is one subscription. It yields the current list immediately (this first
+    /// value does not count toward ``DownloadConfiguration/snapshotInterval``), then at most
+    /// once per interval. It buffers only the newest list, so a slow consumer skips
+    /// intermediate lists instead of growing memory. Ending the iteration in any way,
+    /// including `break`, unsubscribes and never affects transfers.
+    public func snapshots() async -> DownloadSnapshotStream {
+        DownloadSnapshotStream(engine: engine)
     }
 
     // MARK: Local files
 
     /// Returns a validated completed file and a lease, or why none is available.
     ///
-    /// Validation checks the file exists and matches the recorded length. A missing file turns
-    /// the item into ``DownloadState/missing``; a size mismatch fails it with
-    /// ``DownloadFailure/Kind/integrity``. Nothing is fetched from the network here.
+    /// Validation checks the file exists and matches the recorded length. A verifiably absent
+    /// file turns the item into ``DownloadState/missing``; a size mismatch fails it with
+    /// ``DownloadFailure/Kind/integrity``. When the file cannot be inspected at all (for
+    /// example file protection while the device is locked) this throws
+    /// ``DownloadError/fileAccessFailed(_:)`` and changes nothing. Nothing is fetched from the
+    /// network here.
     public func localFile(for id: DownloadID) async throws -> LocalFileResult {
         try await engine.localFile(for: id)
     }

@@ -2,6 +2,10 @@ import Foundation
 @testable import DownloadKit
 
 /// A transfer session driven entirely by the test.
+///
+/// Live tasks carry the durable description the manager asked for, so reconciliation maps
+/// them exactly as it would map system tasks. Events are sequence-numbered; a backlog given
+/// at creation is delivered first, followed by the backlog marker.
 actor FakeTransferSession: TransferSession {
     struct Cancellation: Equatable {
         let taskIdentifier: Int
@@ -9,23 +13,41 @@ actor FakeTransferSession: TransferSession {
     }
 
     nonisolated let identifier: String
-    nonisolated let events: AsyncStream<TransferEvent>
-    private nonisolated let continuation: AsyncStream<TransferEvent>.Continuation
+    nonisolated let events: AsyncStream<TransferSessionEvent>
+    private nonisolated let continuation: AsyncStream<TransferSessionEvent>.Continuation
 
     private(set) var submissions: [TransferSubmission] = []
     private(set) var cancellations: [Cancellation] = []
     private(set) var liveTasks: [TransferTaskReference] = []
+    private(set) var unmappedTasks: [SystemTransferTask] = []
+    private(set) var acknowledged: UInt64?
     private var nextTaskIdentifier = 100
+    private var nextSequence: UInt64 = 0
     private var submitFailure: TransferFailure?
     private let log: CallLog?
 
-    init(identifier: String, liveTasks: [TransferTaskReference] = [], log: CallLog? = nil) {
+    init(
+        identifier: String,
+        liveTasks: [TransferTaskReference] = [],
+        unmappedTasks: [SystemTransferTask] = [],
+        backlog: [TransferEvent] = [],
+        log: CallLog? = nil
+    ) {
         self.identifier = identifier
         self.liveTasks = liveTasks
+        self.unmappedTasks = unmappedTasks
         self.log = log
-        let (stream, continuation) = AsyncStream.makeStream(of: TransferEvent.self)
+        let (stream, continuation) = AsyncStream.makeStream(of: TransferSessionEvent.self)
         self.events = stream
         self.continuation = continuation
+        var sequence: UInt64 = 0
+        for event in backlog {
+            sequence += 1
+            continuation.yield(TransferSessionEvent(sequence: sequence, payload: .transfer(event)))
+        }
+        sequence += 1
+        continuation.yield(TransferSessionEvent(sequence: sequence, payload: .backlogDelivered))
+        self.nextSequence = sequence
     }
 
     func setSubmitFailure(_ failure: TransferFailure?) {
@@ -47,8 +69,14 @@ actor FakeTransferSession: TransferSession {
         liveTasks.removeAll { $0.taskIdentifier == taskIdentifier }
     }
 
-    func activeTasks() -> [TransferTaskReference] {
-        liveTasks
+    func systemTasks() -> [SystemTransferTask] {
+        liveTasks.map {
+            SystemTransferTask(taskIdentifier: $0.taskIdentifier, taskDescription: TransferTaskReference.taskDescription(itemID: $0.itemID, generation: $0.generation))
+        } + unmappedTasks
+    }
+
+    func acknowledge(through sequence: UInt64) {
+        acknowledged = sequence
     }
 
     /// The reference of the most recent submission for `id`.
@@ -56,8 +84,17 @@ actor FakeTransferSession: TransferSession {
         liveTasks.last { $0.itemID == id }
     }
 
-    nonisolated func emit(_ event: TransferEvent) {
-        continuation.yield(event)
+    /// Emits one task event and returns its sequence number.
+    @discardableResult
+    func emit(_ event: TransferEvent) -> UInt64 {
+        emit(payload: .transfer(event))
+    }
+
+    @discardableResult
+    func emit(payload: TransferSessionEvent.Payload) -> UInt64 {
+        nextSequence += 1
+        continuation.yield(TransferSessionEvent(sequence: nextSequence, payload: payload))
+        return nextSequence
     }
 }
 

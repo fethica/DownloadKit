@@ -75,6 +75,9 @@ public enum TransferFailure: Error, Hashable, Sendable {
     case cancelled
     /// The request was refused because the current network is not allowed by policy.
     case policyBlocked
+    /// The host could not provide a transfer URL for the attempt (see
+    /// ``URLRefreshing/transferURL(for:sourceURL:metadata:)``).
+    case credentialsUnavailable
     case unknown
 
     /// The handling class of this failure.
@@ -97,6 +100,8 @@ public enum TransferFailure: Error, Hashable, Sendable {
             return .cancelled
         case .policyBlocked:
             return .policyWait
+        case .credentialsUnavailable:
+            return .authentication
         case .unknown:
             return .unknown
         }
@@ -131,6 +136,8 @@ public enum TransferFailure: Error, Hashable, Sendable {
             return DownloadFailure(kind: .invalidResponse)
         case .cancelled:
             return DownloadFailure(kind: .cancelled)
+        case .credentialsUnavailable:
+            return DownloadFailure(kind: .unauthorized)
         case .policyBlocked, .unknown:
             return DownloadFailure(kind: .unknown)
         }

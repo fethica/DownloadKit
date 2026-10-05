@@ -32,7 +32,11 @@ struct DownloadStateMachine: Sendable, Equatable {
         case removalFinished(DownloadID, generation: UInt64)
         case fileMissing(DownloadID, generation: UInt64)
         case fileCorrupt(DownloadID, generation: UInt64)
-        case orphanedIntent(DownloadID)
+        /// Reconciliation established that no task exists for this generation.
+        case orphanedIntent(DownloadID, generation: UInt64)
+        /// The session accepted the cancellation of the task in the record's stopping binding,
+        /// or reconciliation found that task gone.
+        case stopAcknowledged(DownloadID, taskIdentifier: Int)
         case pathChanged(NetworkPathStatus)
     }
 
@@ -156,6 +160,7 @@ struct DownloadStateMachine: Sendable, Equatable {
 
         case .updateSource(let url, let id):
             var record = try existing(id)
+            try validateSource(url, id)
             guard record.request.sourceURL != url else { break }
             record.request.sourceURL = url
             save(record, now: now, into: &outcome)
@@ -163,14 +168,19 @@ struct DownloadStateMachine: Sendable, Equatable {
         return outcome
     }
 
-    private mutating func enqueue(_ request: DownloadRequest, now: Date, into outcome: inout Outcome) throws {
-        guard let scheme = request.url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
-            throw DownloadError.unsupportedURL(request.id)
+    private func validateSource(_ url: URL, _ id: DownloadID) throws {
+        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+            throw DownloadError.unsupportedURL(id)
         }
+        guard url.user == nil, url.password == nil else { throw DownloadError.credentialsInURL(id) }
+    }
+
+    private mutating func enqueue(_ request: DownloadRequest, now: Date, into outcome: inout Outcome) throws {
+        try validateSource(request.url, request.id)
         let identity = RequestIdentity(request)
         guard var record = records[request.id] else {
             records[request.id] = IndexRecord(
-                id: request.id,
+                unchecked: request.id,
                 request: identity,
                 metadata: request.metadata,
                 policy: request.policy,
@@ -179,6 +189,7 @@ struct DownloadStateMachine: Sendable, Equatable {
                 automaticRetryCount: 0,
                 retryAt: nil,
                 binding: nil,
+                stoppingBinding: nil,
                 bytesWritten: 0,
                 expectedBytes: request.expectedLength,
                 validators: nil,
@@ -278,9 +289,14 @@ struct DownloadStateMachine: Sendable, Equatable {
             record.phase = .failed(DownloadFailure(kind: .integrity))
             save(record, now: now, into: &outcome)
 
-        case .orphanedIntent(let id):
-            guard let record = records[id], record.phase.isAwaitingTransfer, record.journal != .captured else { break }
+        case .orphanedIntent(let id, let generation):
+            guard let record = current(id, generation, &outcome), record.phase.isAwaitingTransfer, record.journal != .captured else { break }
             submit(id, now: now, into: &outcome)
+
+        case .stopAcknowledged(let id, let taskIdentifier):
+            guard var record = records[id], record.stoppingBinding?.taskIdentifier == taskIdentifier else { break }
+            record.stoppingBinding = nil
+            save(record, now: now, into: &outcome)
 
         case .pathChanged(let status):
             pathStatus = status
@@ -314,28 +330,48 @@ struct DownloadStateMachine: Sendable, Equatable {
             save(record, now: now, into: &outcome)
 
         case .finished(let reference, let captured, let bytes, let validators):
-            guard var record = current(reference.itemID, reference.generation, &outcome),
-                  record.phase.isAwaitingTransfer || record.phase == .paused,
-                  record.journal != .captured else {
-                // Stale, cancelled or duplicate completion: the captured bytes belong to nobody.
-                outcome.effects.append(.discardFile(captured))
+            guard var record = current(reference.itemID, reference.generation, &outcome) else {
+                // Stale completion: keep the bytes only if some record still owns the path.
+                discardUnowned(captured, into: &outcome)
                 break
             }
-            record.phase = .active
+            if record.journal == .captured {
+                // A replay of the capture already held is a no-op; a second capture for the
+                // same attempt is discarded unless something owns it.
+                if record.stagingPath != captured { discardUnowned(captured, into: &outcome) }
+                break
+            }
+            let finalizeNow: Bool
+            switch record.phase {
+            case .queued, .active, .waiting, .paused:
+                if case .waiting(.retryScheduled) = record.phase { outcome.effects.append(.unscheduleRetry(record.id)) }
+                finalizeNow = true
+            case .failed:
+                // Cancelled (or failed) at this generation: retain the bytes with the record
+                // without publishing a completion. Retry finalises them.
+                finalizeNow = false
+            case .completed, .missing, .removing:
+                discardUnowned(captured, into: &outcome)
+                return
+            }
+            if finalizeNow { record.phase = .active }
             record.journal = .captured
             record.stagingPath = captured
             record.bytesWritten = max(0, bytes)
             record.validators = validators
             record.binding = nil
+            record.retryAt = nil
             save(record, now: now, into: &outcome)
-            outcome.effects.append(.finalize(record.id, generation: record.generation, captured: captured))
+            if finalizeNow {
+                outcome.effects.append(.finalize(record.id, generation: record.generation, captured: captured))
+            }
 
         case .failed(let reference, let failure):
             applyFailure(reference.itemID, reference.generation, failure, now: now, jitter: jitter, into: &outcome)
 
         case .resumeDataCaptured(let reference, let path):
             guard var record = current(reference.itemID, reference.generation, &outcome) else {
-                outcome.effects.append(.discardFile(path))
+                discardUnowned(path, into: &outcome)
                 break
             }
             switch record.phase {
@@ -344,7 +380,7 @@ struct DownloadStateMachine: Sendable, Equatable {
                 record.resumeDataPath = path
                 save(record, now: now, into: &outcome)
             default:
-                outcome.effects.append(.discardFile(path))
+                discardUnowned(path, into: &outcome)
             }
         }
     }
@@ -436,12 +472,16 @@ struct DownloadStateMachine: Sendable, Equatable {
         return .queued
     }
 
+    /// Ends the current attempt. The binding moves to ``IndexRecord/stoppingBinding`` and
+    /// stays persisted until the session acknowledges the cancellation, so a stop interrupted
+    /// by process exit is enforced again by reconciliation.
     private func stopTransfer(_ record: inout IndexRecord, producingResumeData: Bool, into outcome: inout Outcome) {
         if case .waiting(.retryScheduled) = record.phase {
             outcome.effects.append(.unscheduleRetry(record.id))
         }
         if let binding = record.binding {
             outcome.effects.append(.cancelTask(record.id, taskIdentifier: binding.taskIdentifier, producingResumeData: producingResumeData))
+            record.stoppingBinding = binding
         }
         record.binding = nil
         record.retryAt = nil
@@ -456,6 +496,16 @@ struct DownloadStateMachine: Sendable, Equatable {
 
     private mutating func submit(_ id: DownloadID, now: Date, into outcome: inout Outcome) {
         guard var record = records[id] else { return }
+        if record.journal == .captured, let captured = record.stagingPath {
+            // Captured bytes belong to their generation: recover the pending finalisation
+            // instead of starting a transfer that the capture would shadow.
+            record.binding = nil
+            record.retryAt = nil
+            record.phase = .active
+            save(record, now: now, into: &outcome)
+            outcome.effects.append(.finalize(id, generation: record.generation, captured: captured))
+            return
+        }
         record.generation = allocateGeneration()
         record.binding = nil
         record.retryAt = nil
@@ -468,10 +518,22 @@ struct DownloadStateMachine: Sendable, Equatable {
             resumeDataPath: record.resumeDataPath,
             expectedLength: record.request.expectedLength
         )
+        if record.resumeDataPath == nil {
+            // A fresh attempt: nothing from an earlier response carries over.
+            record.bytesWritten = 0
+            record.expectedBytes = record.request.expectedLength
+            record.validators = nil
+        }
         // Resume data is handed to the session, which owns it from now on.
         record.resumeDataPath = nil
         save(record, now: now, into: &outcome)
         outcome.effects.append(.submit(submission))
+    }
+
+    /// Discards `path` only when no record owns it.
+    private func discardUnowned(_ path: RelativePath, into outcome: inout Outcome) {
+        guard !records.values.contains(where: { $0.ownedPaths.contains(path) }) else { return }
+        outcome.effects.append(.discardFile(path))
     }
 
     private mutating func save(_ record: IndexRecord, now: Date, into outcome: inout Outcome) {

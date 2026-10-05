@@ -126,6 +126,7 @@ final class DownloadManagerLifecycleTests: XCTestCase {
         let second = try Harness(namespace: first.namespace, sessionIdentifier: first.sessionIdentifier, fileSystem: first.fileSystem, store: first.store, session: newSession)
         try await second.makeManager().start()
 
+        await eventually("orphan resubmitted after the backlog") { await newSession.submissions.count == 1 }
         let resubmitted = await newSession.submissions
         XCTAssertEqual(resubmitted.map(\.itemID), [itemID("b")])
         XCTAssertEqual(resubmitted.first?.generation, 3, "generations continue from the index")
@@ -196,17 +197,14 @@ final class DownloadManagerLifecycleTests: XCTestCase {
         let manager = harness.makeManager()
         try await manager.start()
         try await manager.enqueue(makeRequest("a"))
-        let stream = await manager.snapshots()
-        let reader = Task {
-            var count = 0
-            for await _ in stream { count += 1 }
-            return count
-        }
+        var iterator = await manager.snapshots().makeAsyncIterator()
+        let first = await iterator.next()
+        XCTAssertEqual(first?.count, 1)
 
         await manager.detach()
 
-        let delivered = await reader.value
-        XCTAssertGreaterThanOrEqual(delivered, 1)
+        let afterDetach = await iterator.next()
+        XCTAssertNil(afterDetach, "detaching ends the stream")
         let cancellations = await harness.session.cancellations
         XCTAssertTrue(cancellations.isEmpty, "detaching never cancels transfers")
         await assertThrows(.notStarted) { try await manager.pause(itemID("a")) }
@@ -241,4 +239,10 @@ func completeItem(_ raw: String, size: Int64 = 10, manager: DownloadManager, har
     let captured = path("staging/\(raw)-\(reference.generation)")
     await harness.fileSystem.putFile(harness.url(captured), size: size)
     await manager.engine.ingest(.transfer(.finished(reference, captured: captured, bytes: size, validators: nil)))
+    await settle(manager)
+}
+
+/// Waits until no finalisation is running, so its result has been applied.
+func settle(_ manager: DownloadManager) async {
+    await eventually("finalisation settled") { await manager.engine.finalizationsInFlight == 0 }
 }

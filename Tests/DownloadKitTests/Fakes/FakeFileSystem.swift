@@ -12,6 +12,7 @@ actor FakeFileSystem: DownloadFileSystem {
     private var failApplicationSupport = false
     private var failCreateDirectory = false
     private var failRemove = false
+    private var failInspection = false
 
     init() {
         applicationSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -19,10 +20,11 @@ actor FakeFileSystem: DownloadFileSystem {
             .appendingPathComponent("Application Support", isDirectory: true)
     }
 
-    func configure(failApplicationSupport: Bool = false, failCreateDirectory: Bool = false, failRemove: Bool = false) {
+    func configure(failApplicationSupport: Bool = false, failCreateDirectory: Bool = false, failRemove: Bool = false, failInspection: Bool = false) {
         self.failApplicationSupport = failApplicationSupport
         self.failCreateDirectory = failCreateDirectory
         self.failRemove = failRemove
+        self.failInspection = failInspection
     }
 
     func putFile(_ url: URL, size: Int64) {
@@ -55,8 +57,25 @@ actor FakeFileSystem: DownloadFileSystem {
         if excluded { excludedFromBackup.insert(Self.key(url)) } else { excludedFromBackup.remove(Self.key(url)) }
     }
 
-    func fileSize(at url: URL) -> Int64? {
-        files[Self.key(url)]
+    func inspectItem(at url: URL) throws -> FileStatus {
+        if failInspection { throw FakeError.injected }
+        guard let size = files[Self.key(url)] else { return .absent }
+        return .file(size: size)
+    }
+
+    func contentsOfDirectory(at url: URL) throws -> [String] {
+        let prefix = Self.key(url) + "/"
+        return files.keys.filter { $0.hasPrefix(prefix) }.map { String($0.dropFirst(prefix.count)) }.sorted()
+    }
+
+    func readBytes(at url: URL, offset: Int64, maximumLength: Int) throws -> Data {
+        guard let size = files[Self.key(url)] else { throw FakeError.injected }
+        let available = max(0, size - offset)
+        return Data(count: Int(min(Int64(maximumLength), available)))
+    }
+
+    func synchronizeFile(at url: URL) throws {
+        guard files[Self.key(url)] != nil else { throw FakeError.injected }
     }
 
     func removeItem(at url: URL) throws {

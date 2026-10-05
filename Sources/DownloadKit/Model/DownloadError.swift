@@ -17,6 +17,9 @@ public enum DownloadError: Error, Hashable, Sendable {
     case invalidRelativePath(String)
     /// The request URL is not `http` or `https`.
     case unsupportedURL(DownloadID)
+    /// The source URL carries a user or password component. Credentials are never stored;
+    /// see ``URLRefreshing``.
+    case credentialsInURL(DownloadID)
     /// A command arrived before ``DownloadManager/start()`` finished, or after
     /// ``DownloadManager/detach()``.
     case notStarted
@@ -31,7 +34,9 @@ public enum DownloadError: Error, Hashable, Sendable {
     case unsupportedSchema(found: Int, supported: Int)
     /// The index cannot be read. It is left untouched; nothing is reset.
     case corruptIndex
-    /// The index rejected a write. In-memory state was not changed.
+    /// The index rejected a write. In-memory state was not changed. For transfer events and
+    /// internal follow-ups the work is kept and retried; see
+    /// ``DownloadManager/flushPendingWork()``.
     case persistenceFailed
     /// The transfer session could not be created.
     case transportUnavailable
@@ -43,4 +48,9 @@ public enum DownloadError: Error, Hashable, Sendable {
     case itemBeingRemoved(DownloadID)
     /// A scoped file access was requested for an item without a usable completed file.
     case fileUnavailable(LocalFileUnavailableReason)
+    /// The completed file of the item could not be inspected (permission, file protection,
+    /// I/O). Nothing was concluded: the record and its file are kept as they were.
+    case fileAccessFailed(DownloadID)
+    /// A stored record passed to ``IndexRecord`` has contradictory fields.
+    case invalidStoredRecord(DownloadID)
 }

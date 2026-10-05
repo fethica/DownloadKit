@@ -132,11 +132,11 @@ final class DownloadManagerCommandTests: XCTestCase {
         let captured = path("staging/a")
         await harness.fileSystem.putFile(harness.url(captured), size: 30)
 
-        harness.session.emit(.progress(reference, bytesWritten: 10, expectedBytes: 30))
-        harness.session.emit(.progress(reference, bytesWritten: 20, expectedBytes: 30))
-        harness.session.emit(.waiting(reference, .connectivity))
-        harness.session.emit(.progress(reference, bytesWritten: 30, expectedBytes: 30))
-        harness.session.emit(.finished(reference, captured: captured, bytes: 30, validators: nil))
+        await harness.session.emit(.progress(reference, bytesWritten: 10, expectedBytes: 30))
+        await harness.session.emit(.progress(reference, bytesWritten: 20, expectedBytes: 30))
+        await harness.session.emit(.waiting(reference, .connectivity))
+        await harness.session.emit(.progress(reference, bytesWritten: 30, expectedBytes: 30))
+        await harness.session.emit(.finished(reference, captured: captured, bytes: 30, validators: nil))
 
         await eventually("item completes") { await manager.snapshot(for: itemID("a"))?.isAvailableOffline == true }
         let snapshot = await manager.snapshot(for: itemID("a"))
@@ -357,7 +357,7 @@ final class DownloadManagerCommandTests: XCTestCase {
 
         let submissions = await harness.session.submissions
         let cancellations = await harness.session.cancellations
-        let live = await harness.session.activeTasks()
+        let live = await harness.session.systemTasks()
         XCTAssertEqual(submissions.count, 4)
         XCTAssertEqual(cancellations.count, 2)
         XCTAssertEqual(live.count, 2, "exactly one live task per item")
@@ -438,8 +438,7 @@ final class DownloadManagerCommandTests: XCTestCase {
         try await manager.enqueue(makeRequest("a"))
         let stream = await manager.snapshots()
         let reader = Task { for await _ in stream {} }
-        let subscribed = await manager.engine.subscriberCount
-        XCTAssertEqual(subscribed, 1)
+        await eventually("subscribed") { await manager.engine.subscriberCount == 1 }
 
         reader.cancel()
 
