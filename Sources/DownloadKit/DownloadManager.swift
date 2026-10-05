@@ -45,7 +45,9 @@ public final class DownloadManager: Sendable {
     ///
     /// `backgroundEvents` is the host's relaunch receiver. When it accepts this manager's
     /// ``DownloadConfiguration/sessionIdentifier``, handlers it received (before or after this
-    /// manager was created) are answered by this manager; otherwise the manager keeps its own.
+    /// manager was created) are answered by this manager, and their deadlines are the
+    /// receiver's ``BackgroundTransferEvents/wakeBudget``; otherwise the manager keeps its own
+    /// handlers, with ``DownloadConfiguration/backgroundWakeBudget`` deadlines.
     public convenience init(configuration: DownloadConfiguration, urlRefresher: (any URLRefreshing)? = nil, backgroundEvents: BackgroundTransferEvents? = nil) {
         let dependencies = configuration.dependencies
         self.init(configuration: configuration, urlRefresher: urlRefresher, finalizer: FileFinalizer(fileSystem: dependencies.fileSystem, clock: dependencies.clock), backgroundEvents: backgroundEvents)
@@ -53,7 +55,8 @@ public final class DownloadManager: Sendable {
 
     init(configuration: DownloadConfiguration, urlRefresher: (any URLRefreshing)?, finalizer: any DownloadFinalizing, backgroundEvents relay: BackgroundTransferEvents? = nil) {
         self.configuration = configuration
-        let backgroundEvents = relay?.coordinator(for: configuration.sessionIdentifier) ?? BackgroundEventsCoordinator()
+        let backgroundEvents = relay?.coordinator(for: configuration.sessionIdentifier)
+            ?? BackgroundEventsCoordinator(budget: configuration.backgroundWakeBudget, clock: configuration.dependencies.clock)
         self.backgroundEvents = backgroundEvents
         self.engine = DownloadEngine(configuration: configuration, urlRefresher: urlRefresher, finalizer: finalizer, backgroundEvents: backgroundEvents, host: host)
     }
@@ -94,7 +97,10 @@ public final class DownloadManager: Sendable {
     /// this manager's session identifier; the host stays responsible for it. Otherwise the
     /// handler is kept (even before ``start()`` finished) and called exactly once on the main
     /// actor after the manager has applied every event the system delivered for the wake, or
-    /// at ``DownloadConfiguration/backgroundWakeBudget`` (see ``BackgroundTransferEvents``).
+    /// at its deadline: the receiver's ``BackgroundTransferEvents/wakeBudget`` when one was
+    /// passed at creation, ``DownloadConfiguration/backgroundWakeBudget`` otherwise, counted
+    /// from this call. The deadline holds when ``start()`` fails and after ``detach()`` (see
+    /// ``BackgroundTransferEvents``).
     @MainActor
     @discardableResult
     public func handleBackgroundEvents(forSession identifier: String, completionHandler: @escaping () -> Void) -> Bool {

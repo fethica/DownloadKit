@@ -27,8 +27,9 @@ enum DelegateCallback: Sendable {
     case restart(taskIdentifier: Int, description: String?, request: URLRequest? = nil)
     case completed(taskIdentifier: Int, description: String?, failure: TransferFailure?)
     /// The system delivered every event of a background wake
-    /// (`urlSessionDidFinishEvents(forBackgroundURLSession:)`).
-    case eventsFinished
+    /// (`urlSessionDidFinishEvents(forBackgroundURLSession:)`). `order` places it among the
+    /// host's accepted wake handlers, taken inside the callback.
+    case eventsFinished(order: UInt64)
     /// Every callback queued before this one has been forwarded.
     case barrier(UUID)
     case invalidated
@@ -178,7 +179,9 @@ final class TransferDelegate: NSObject, URLSessionDownloadDelegate, Sendable {
     /// delegate queue after those events' callbacks, so it reaches the session's actor behind
     /// them.
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
-        channel.yield(.eventsFinished)
+        // The order is taken here, before any storage delay: the marker answers only the wake
+        // handlers accepted before this callback.
+        channel.yield(.eventsFinished(order: WakeOrder.next()))
     }
 
     func urlSession(_ session: URLSession, didBecomeInvalidWithError error: (any Error)?) {

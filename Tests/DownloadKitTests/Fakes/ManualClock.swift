@@ -15,6 +15,12 @@ actor ManualClock: DownloadClock {
     var sleeperCount: Int { sleepers.count }
     var deadlines: [Date] { sleepers.values.map(\.deadline).sorted() }
 
+    /// Whether a sleeper waits for exactly `deadline`. Timers are told apart by their
+    /// deadline, so a wait for one timer is never satisfied by another.
+    func hasSleeper(until deadline: Date) -> Bool {
+        sleepers.values.contains { $0.deadline == deadline }
+    }
+
     func sleep(until deadline: Date) async throws {
         guard deadline > current else { return }
         let id = UUID()

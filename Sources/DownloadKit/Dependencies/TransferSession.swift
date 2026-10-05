@@ -62,11 +62,12 @@ public protocol TransferSession: Sendable {
     ///   it reports ``ReconciliationStatus/unresolved(items:reason:)`` and still creates no
     ///   replacement.
     /// - ``TransferSessionEvent/Payload/backgroundEventsFinished`` is sent from the system's
-    ///   wake-drained callback, after it delivered all events of a background wake. It is also
-    ///   a drain boundary for reconciliation. If the wake's events cannot be committed within
-    ///   ``DownloadConfiguration/backgroundWakeBudget``, the host's handler is called anyway
-    ///   and the events stay unacknowledged; the session must keep them durably (captured
-    ///   files in `staging/`, events in its inbox) and deliver them again.
+    ///   wake-drained callback, after it delivered all events of a background wake; create its
+    ///   ``TransferSessionEvent`` in that callback, because it answers only the wake handlers
+    ///   accepted before it was created. It is also a drain boundary for reconciliation. If the
+    ///   wake's events cannot be committed before a handler's deadline, the handler is called
+    ///   anyway and the events stay unacknowledged; the session must keep them durably
+    ///   (captured files in `staging/`, events in its inbox) and deliver them again.
     /// - The stream finishes only when the session is invalidated. The manager then stops
     ///   ingesting; unresolved reconciliation is reported and waits for the next start.
     var events: AsyncStream<TransferSessionEvent> { get }

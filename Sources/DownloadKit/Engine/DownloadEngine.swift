@@ -12,10 +12,10 @@
 //  rejected is kept and retried at the start of every later step (and by flushPendingWork);
 //  only advisory progress and waiting events may be dropped.
 //
-//  Reception: session events are appended to the inbox, and a wake marker arms the wake
-//  budget, as they arrive, outside the chain; only their application is a step. A step that
-//  waits on the index therefore cannot hide a later marker, and the wake budget and the
-//  reconciliation deadline are both enforced outside the chain.
+//  Reception: session events are appended to the inbox as they arrive, outside the chain;
+//  only their application is a step. The reconciliation deadline is enforced outside the
+//  chain, and the host's wake handlers have their own deadlines in their coordinator, so a
+//  step that waits on the index holds neither.
 //
 //  File workers: a finaliser runs outside the chain and is an ownership claim on its item's
 //  files and on the storage root. Its destination is persisted with the capture before it
@@ -107,9 +107,6 @@ actor DownloadEngine {
     private var drainWaiters: [CheckedContinuation<Void, Never>] = []
     private var fence: Fence = .notStarted
     private var fenceTimer: Task<Void, Never>?
-    /// Wake markers whose host handlers were already released by the wake budget.
-    private var servicedWakeMarkers: Set<UInt64> = []
-    private var wakeTimer: Task<Void, Never>?
     private var consumers: [Task<Void, Never>] = []
     private var flushTask: Task<Void, Never>?
     private var lastEmission: Date?
@@ -191,7 +188,6 @@ actor DownloadEngine {
             lifecycle = .running
             await reconcile()
             startConsumers()
-            await attachBackgroundEvents()
         } catch {
             teardown()
             await releaseClaimIfHeld()
@@ -592,8 +588,6 @@ actor DownloadEngine {
         for finalization in finalizations.values { finalization.cancel() }
         fenceTimer?.cancel()
         fenceTimer = nil
-        wakeTimer?.cancel()
-        wakeTimer = nil
         flushTask?.cancel()
         flushTask = nil
         for continuation in subscribers.values { continuation.finish() }
@@ -678,9 +672,9 @@ actor DownloadEngine {
         _ = try? await serialized { [self] in await self.applyRetaining(event) }
     }
 
-    /// Receives one session event outside the chain: it joins the ordered inbox at once, a
-    /// wake marker arms the wake budget at once, and one drain step is queued to apply it. A
-    /// step suspended on the index delays application, never reception.
+    /// Receives one session event outside the chain: it joins the ordered inbox at once, and
+    /// one drain step is queued to apply it. A step suspended on the index delays application,
+    /// never reception.
     private func accept(_ event: TransferSessionEvent) async {
         guard lifecycle == .running else { return }
         inbox.append(event)
@@ -688,7 +682,6 @@ actor DownloadEngine {
             drainQueued = true
             submitStep { [self] in await self.runQueuedDrain() }
         }
-        if hasUnservicedWakeMarker { await armWakeBudget() }
     }
 
     /// Usually the step's pending-work prelude has applied the inbox already (one attempt per
@@ -699,8 +692,8 @@ actor DownloadEngine {
     }
 
     /// Applies inbox entries in order until one cannot be committed, then acknowledges the
-    /// applied prefix to the session. A wake marker stuck behind an uncommitted entry arms the
-    /// wake budget.
+    /// applied prefix to the session. A wake marker stuck behind an uncommitted entry leaves its
+    /// handlers to their deadlines.
     private func drainInbox() async {
         guard lifecycle == .running else { return }
         // Events received from here on queue another drain step.
@@ -717,15 +710,6 @@ actor DownloadEngine {
         }
         inboxBlocked = blocked
         if let applied, let session { await session.acknowledge(through: applied) }
-        if hasUnservicedWakeMarker {
-            await armWakeBudget()
-        } else if await hasWaitingWakeHandler() {
-            // A handler whose marker has not come (or came before it): the budget releases it.
-            await armWakeBudget()
-        } else {
-            wakeTimer?.cancel()
-            wakeTimer = nil
-        }
     }
 
     private func process(_ envelope: TransferSessionEvent) async -> Bool {
@@ -746,74 +730,12 @@ actor DownloadEngine {
             }
             return true
         case .backgroundEventsFinished:
-            // The system delivered every event of the wake: also a drain boundary.
+            // The system delivered every event of the wake: also a drain boundary. Only the
+            // handlers accepted before the system reported it are answered.
             guard await resolveFence() else { return false }
-            if servicedWakeMarkers.remove(envelope.sequence) == nil, let backgroundEvents {
-                await backgroundEvents.eventsApplied()
-            }
+            if let backgroundEvents { await backgroundEvents.eventsApplied(through: envelope.wakeOrder) }
             return true
         }
-    }
-
-    /// Connects the host's wake handlers: one already waiting (forwarded before start) arms
-    /// the wake budget now, and every later one arms it when it arrives.
-    private func attachBackgroundEvents() async {
-        guard let backgroundEvents else { return }
-        let waiting = await backgroundEvents.attach { [weak self] in
-            Task { await self?.wakeHandlerArrived() }
-        }
-        if waiting > 0 { await armWakeBudget() }
-    }
-
-    private func wakeHandlerArrived() async {
-        guard lifecycle == .running else { return }
-        await armWakeBudget()
-    }
-
-    private var hasUnservicedWakeMarker: Bool {
-        inbox.contains { envelope in
-            guard case .backgroundEventsFinished = envelope.payload else { return false }
-            return !servicedWakeMarkers.contains(envelope.sequence)
-        }
-    }
-
-    private func armWakeBudget() async {
-        guard wakeTimer == nil, backgroundEvents != nil else { return }
-        let clock = dependencies.clock
-        let deadline = await clock.now().addingTimeInterval(configuration.backgroundWakeBudget)
-        guard wakeTimer == nil else { return }
-        wakeTimer = Task { [weak self] in
-            do {
-                try await clock.sleep(until: deadline)
-            } catch {
-                return
-            }
-            await self?.wakeBudgetExpired()
-        }
-    }
-
-    private func hasWaitingWakeHandler() async -> Bool {
-        guard let backgroundEvents else { return false }
-        return await backgroundEvents.pendingHandlerCount > 0
-    }
-
-    /// The wake budget passed while its events could not be committed, or while a handler
-    /// still waits for a marker that has not come. Runs outside the chain, so a step stuck on
-    /// the index cannot hold the host's handler: the handlers are released now, and the
-    /// uncommitted events stay unacknowledged with the session, which keeps them durably and
-    /// delivers them again. A marker already received is then serviced: applying it later calls
-    /// nothing.
-    private func wakeBudgetExpired() async {
-        wakeTimer = nil
-        guard lifecycle == .running else { return }
-        var released = false
-        for envelope in inbox {
-            guard case .backgroundEventsFinished = envelope.payload, !servicedWakeMarkers.contains(envelope.sequence) else { continue }
-            servicedWakeMarkers.insert(envelope.sequence)
-            released = true
-        }
-        if !released { released = await hasWaitingWakeHandler() }
-        if released, let backgroundEvents { await backgroundEvents.eventsApplied() }
     }
 
     /// Fires every scheduled retry whose time has come.

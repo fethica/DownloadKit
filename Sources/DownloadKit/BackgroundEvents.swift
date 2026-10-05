@@ -3,7 +3,7 @@
 //  DownloadKit
 //
 //  Holds the host's background-wake completion handlers until the manager has applied every
-//  session event of the wake, or until the wake budget passed.
+//  session event of the wake, or until the handler's own deadline passed.
 //
 
 import Foundation
@@ -26,34 +26,45 @@ import Foundation
 /// Contract:
 /// - Only the identifiers given at creation are accepted; any other identifier returns `false`
 ///   and the handler is not kept (the host stays responsible for it).
-/// - A handler may arrive before the manager exists, before it started, or after. It is kept
-///   until the manager for its identifier has applied every event up to the session's
-///   wake-drained marker (``TransferSessionEvent/Payload/backgroundEventsFinished``), then
-///   called once, on the main actor. A second callback (a duplicate forward, or a later wake)
-///   adds a second handler; each one is called exactly once.
-/// - When the wake's events cannot be committed within
-///   ``DownloadConfiguration/backgroundWakeBudget`` (counted from the first unanswered
-///   handler or marker the running manager saw), the waiting handlers are called anyway and
-///   the uncommitted events stay unacknowledged with the session, which delivers them again.
-/// - Without a started manager for its identifier, a handler is never called. Starting the
-///   manager at launch is the host's part of the contract.
+/// - Every accepted handler gets its own deadline, ``wakeBudget`` after it was accepted. The
+///   deadline runs in the receiver, not in a manager: it holds when no manager exists yet,
+///   when ``DownloadManager/start()`` fails or never finishes, and after
+///   ``DownloadManager/detach()``. At the deadline the handler is called, and events not yet
+///   committed stay unacknowledged with the session, which delivers them again; no transfer
+///   and no index record is changed.
+/// - A handler is called earlier when the running manager has applied every event up to the
+///   session's wake-drained marker (``TransferSessionEvent/Payload/backgroundEventsFinished``)
+///   that the system reported after the handler was accepted. A marker never releases a
+///   handler accepted after the marker was reported, so a late marker of an earlier wake cannot
+///   answer a newer wake.
+/// - Each handler is called exactly once, on the main actor. A second callback (a duplicate
+///   forward, or a later wake) adds a second handler with its own deadline.
 @MainActor
 public final class BackgroundTransferEvents {
+    /// The longest a handler waits after it was accepted.
+    public nonisolated let wakeBudget: TimeInterval
     private let coordinators: [String: BackgroundEventsCoordinator]
 
     /// Accepts the wakes of `sessionIdentifiers`: the ``DownloadConfiguration/sessionIdentifier``
-    /// of each manager the app runs.
-    public nonisolated init(sessionIdentifiers: Set<String>) {
+    /// of each manager the app runs. `wakeBudget` bounds how long each handler is kept; keep it
+    /// well below the time the system gives a background wake.
+    public nonisolated convenience init(sessionIdentifiers: Set<String>, wakeBudget: TimeInterval = 20) {
+        self.init(sessionIdentifiers: sessionIdentifiers, wakeBudget: wakeBudget, clock: SystemClock())
+    }
+
+    nonisolated init(sessionIdentifiers: Set<String>, wakeBudget: TimeInterval, clock: any DownloadClock) {
+        let budget = max(0, wakeBudget)
+        self.wakeBudget = budget
         var coordinators: [String: BackgroundEventsCoordinator] = [:]
-        for identifier in sessionIdentifiers { coordinators[identifier] = BackgroundEventsCoordinator() }
+        for identifier in sessionIdentifiers { coordinators[identifier] = BackgroundEventsCoordinator(budget: budget, clock: clock) }
         self.coordinators = coordinators
     }
 
     /// The identifiers this instance accepts.
     public nonisolated var sessionIdentifiers: Set<String> { Set(coordinators.keys) }
 
-    /// Keeps `completionHandler` for the manager of `identifier`. Returns `false`, without
-    /// keeping it, for an identifier this instance does not accept.
+    /// Keeps `completionHandler` for the manager of `identifier` and starts its deadline.
+    /// Returns `false`, without keeping it, for an identifier this instance does not accept.
     @discardableResult
     public func handleEvents(forSession identifier: String, completionHandler: @escaping () -> Void) -> Bool {
         guard let coordinator = coordinators[identifier] else { return false }
@@ -71,39 +82,73 @@ public final class BackgroundTransferEvents {
     }
 }
 
+/// The process-wide order of accepted wake handlers and of the system's wake-drained
+/// callbacks: the monotonic uptime clock, read where each one happens, before any storage or
+/// manager delay. A marker releases only the handlers accepted strictly before it was reported;
+/// two readings that tie leave the handler to its deadline, never release it early.
+enum WakeOrder {
+    static func next() -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds
+    }
+}
+
 /// Exactly-once holder for the background-wake completion handlers of one session identifier.
 ///
-/// Each registered handler is called once, on the main actor: when the manager has applied
-/// everything up to the session's ``TransferSessionEvent/Payload/backgroundEventsFinished``
-/// marker, or when the wake budget passed. A marker with no waiting handler calls nothing and
-/// is not remembered; a handler registered after its wake's marker was applied is released by
-/// the budget.
+/// Each registered handler is called once, on the main actor: at its own deadline, or earlier
+/// when the manager has applied a wake-drained marker reported after the handler was accepted.
+/// Both paths remove the handler before calling it. A marker reported before a handler was
+/// accepted (a late marker of an earlier wake, or a wake whose marker overtook its handler)
+/// never releases it; its deadline does.
 @MainActor
 final class BackgroundEventsCoordinator {
-    private var handlers: [() -> Void] = []
-    /// The running manager's notification that a handler arrived.
-    private var listener: (@Sendable () -> Void)?
+    private struct Waiting {
+        let order: UInt64
+        let handler: () -> Void
+        let deadline: Task<Void, Never>
+    }
 
-    nonisolated init() {}
+    private let budget: TimeInterval
+    private let clock: any DownloadClock
+    private var waiting: [Waiting] = []
 
-    var pendingHandlerCount: Int { handlers.count }
+    nonisolated init(budget: TimeInterval, clock: any DownloadClock) {
+        self.budget = max(0, budget)
+        self.clock = clock
+    }
+
+    var pendingHandlerCount: Int { waiting.count }
 
     func register(_ handler: @escaping () -> Void) {
-        handlers.append(handler)
-        listener?()
+        let order = WakeOrder.next()
+        let clock = self.clock
+        let budget = self.budget
+        // Holds the coordinator until the deadline, so a handler is answered even when every
+        // manager and receiver reference is gone.
+        let deadline = Task { @MainActor [self] in
+            let due = await clock.now().addingTimeInterval(budget)
+            do {
+                try await clock.sleep(until: due)
+            } catch {
+                return
+            }
+            self.release { $0.order == order }
+        }
+        waiting.append(Waiting(order: order, handler: handler, deadline: deadline))
     }
 
-    /// Connects the running manager; returns the number of handlers already waiting. A later
-    /// manager replaces an earlier one.
-    func attach(_ listener: @escaping @Sendable () -> Void) -> Int {
-        self.listener = listener
-        return handlers.count
+    /// The manager applied everything up to a wake-drained marker reported at `markerOrder`:
+    /// the handlers accepted before it are answered.
+    func eventsApplied(through markerOrder: UInt64) {
+        release { $0.order < markerOrder }
     }
 
-    /// Calls every waiting handler once.
-    func eventsApplied() {
-        let pending = handlers
-        handlers = []
-        for handler in pending { handler() }
+    private func release(where matches: (Waiting) -> Bool) {
+        let due = waiting.filter(matches)
+        guard !due.isEmpty else { return }
+        waiting.removeAll(where: matches)
+        for entry in due {
+            entry.deadline.cancel()
+            entry.handler()
+        }
     }
 }

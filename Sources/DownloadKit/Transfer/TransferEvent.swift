@@ -195,8 +195,8 @@ public struct TransferSessionEvent: Hashable, Sendable {
         /// Only after this marker does the manager decide that an expected task is gone.
         case backlogDelivered
         /// The system finished delivering the events of a background wake. When the manager
-        /// has applied everything before this marker, it calls the host's completion handler
-        /// registered through ``DownloadManager/handleBackgroundEvents(forSession:completionHandler:)``.
+        /// has applied everything before this marker, it calls the host's completion handlers
+        /// accepted before the marker was reported (``BackgroundTransferEvents``).
         case backgroundEventsFinished
         /// The session could not read or store its durable backlog (an unreadable inbox, or a
         /// terminal event or sequence reservation it could not write), so it withholds
@@ -213,9 +213,29 @@ public struct TransferSessionEvent: Hashable, Sendable {
     /// ``TransferSession/acknowledge(through:)``.
     public let sequence: UInt64
     public let payload: Payload
+    /// Where a ``Payload/backgroundEventsFinished`` marker stands among the host's accepted
+    /// wake handlers: it releases only those accepted before it. Not part of the event's
+    /// identity.
+    let wakeOrder: UInt64
 
+    /// A ``Payload/backgroundEventsFinished`` marker is placed after every wake handler accepted
+    /// so far: create it when the system reports the wake drained, not later.
     public init(sequence: UInt64, payload: Payload) {
+        self.init(sequence: sequence, payload: payload, wakeOrder: payload == .backgroundEventsFinished ? WakeOrder.next() : 0)
+    }
+
+    init(sequence: UInt64, payload: Payload, wakeOrder: UInt64) {
         self.sequence = sequence
         self.payload = payload
+        self.wakeOrder = wakeOrder
+    }
+
+    public static func == (lhs: TransferSessionEvent, rhs: TransferSessionEvent) -> Bool {
+        lhs.sequence == rhs.sequence && lhs.payload == rhs.payload
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(sequence)
+        hasher.combine(payload)
     }
 }

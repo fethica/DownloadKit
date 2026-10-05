@@ -387,7 +387,7 @@ final class DownloadManagerOwnershipTests: XCTestCase {
         await harness.store.setFailWrites(true)
         let finished = await harness.session.emit(.finished(reference, captured: captured, bytes: 10, validators: nil))
         let marker = await harness.session.emit(payload: .backgroundEventsFinished)
-        await eventually("wake budget armed") { await harness.clock.sleeperCount == 1 }
+        await eventually("wake deadline armed") { await harness.clock.hasSleeper(until: referenceDate.addingTimeInterval(10)) }
         let early = await MainActor.run { counter.count }
         XCTAssertEqual(early, 0)
 
@@ -739,7 +739,7 @@ final class DownloadManagerOwnershipTests: XCTestCase {
         let finished = await harness.session.emit(.finished(reference, captured: captured, bytes: 10, validators: nil))
         let marker = await harness.session.emit(payload: .backgroundEventsFinished)
         await eventually("write suspended") { await harness.store.heldWriteCount == 1 }
-        await eventually("wake budget armed while the write waits") { await harness.clock.sleeperCount == 1 }
+        await eventually("wake deadline armed while the write waits") { await harness.clock.hasSleeper(until: referenceDate.addingTimeInterval(10)) }
 
         await harness.clock.advance(by: 10)
         await eventually("handler released at the budget") { await MainActor.run { counter.count } == 1 }

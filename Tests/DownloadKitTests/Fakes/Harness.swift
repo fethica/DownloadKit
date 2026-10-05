@@ -67,6 +67,12 @@ struct Harness {
         DownloadManager(configuration: configuration, urlRefresher: urlRefresher, finalizer: finalizer, backgroundEvents: backgroundEvents)
     }
 
+    /// The host's relaunch receiver for this harness's identifier, on the harness clock, with
+    /// the configuration's wake budget.
+    func makeRelay(wakeBudget: TimeInterval? = nil) -> BackgroundTransferEvents {
+        BackgroundTransferEvents(sessionIdentifiers: [sessionIdentifier], wakeBudget: wakeBudget ?? configuration.backgroundWakeBudget, clock: clock)
+    }
+
     var root: URL {
         fileSystem.applicationSupport.appendingPathComponent(namespace, isDirectory: true)
     }

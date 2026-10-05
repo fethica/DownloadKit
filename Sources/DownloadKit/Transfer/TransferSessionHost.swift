@@ -36,6 +36,8 @@ actor TransferSessionHost {
         let event: TransferEvent?
         let receipt: UUID?
         var sequence: UInt64?
+        /// A wake marker's place among the accepted wake handlers.
+        var wakeOrder: UInt64 = 0
     }
 
     let identifier: String
@@ -78,8 +80,8 @@ actor TransferSessionHost {
     private var replacements: [Int: Int] = [:]
     /// Durable restarts, by refused task, read back after a relaunch or written in this process.
     private var restarts: [Int: RestartIntent] = [:]
-    /// A wake marker arrived while no manager was subscribed.
-    private var wakeMarkerOwed = false
+    /// Wake markers (their order) that arrived while no manager was subscribed.
+    private var owedWakeMarkers: [UInt64] = []
     private var lastProgress: [Int: Int64] = [:]
 
     /// `tasksOutliveProcess` overrides the mode's answer (tests only: a foreground session
@@ -185,11 +187,11 @@ actor TransferSessionHost {
                 yield(stored.sequence, .transfer(event))
             }
         }
-        if wakeMarkerOwed {
-            // Behind the replay and anything still waiting to be stored.
-            wakeMarkerOwed = false
-            pending.append(PendingEvent(event: nil, receipt: nil, sequence: nil))
+        // Behind the replay and anything still waiting to be stored.
+        for order in owedWakeMarkers {
+            pending.append(PendingEvent(event: nil, receipt: nil, sequence: nil, wakeOrder: order))
         }
+        owedWakeMarkers = []
         let session = self.session
         let queue = delegateQueue
         let channel = self.channel
@@ -372,8 +374,8 @@ actor TransferSessionHost {
             // A task that ended without a usable file and without an error had no usable response.
             deliver(.failed(reference, failure ?? .invalidResponse), receipt: nil)
 
-        case .eventsFinished:
-            pending.append(PendingEvent(event: nil, receipt: nil, sequence: nil))
+        case .eventsFinished(let order):
+            pending.append(PendingEvent(event: nil, receipt: nil, sequence: nil, wakeOrder: order))
             flushPending()
 
         case .barrier(let token):
@@ -468,7 +470,7 @@ actor TransferSessionHost {
                 guard let event = head.event else {
                     // A wake marker: nothing to store, everything before it is stored.
                     pending.removeFirst()
-                    yield(sequence, .backgroundEventsFinished)
+                    yield(sequence, .backgroundEventsFinished, wakeOrder: head.wakeOrder)
                     continue
                 }
                 // Terminal events always have a stored form.
@@ -516,16 +518,16 @@ actor TransferSessionHost {
         yield(sequence, payload)
     }
 
-    private func yield(_ sequence: UInt64, _ payload: TransferSessionEvent.Payload) {
+    private func yield(_ sequence: UInt64, _ payload: TransferSessionEvent.Payload, wakeOrder: UInt64 = 0) {
         guard let subscriber else {
             // Stored events are replayed to the next subscriber; a wake marker is owed to it.
-            if payload == .backgroundEventsFinished { wakeMarkerOwed = true }
+            if payload == .backgroundEventsFinished { owedWakeMarkers.append(wakeOrder) }
             return
         }
-        if case .terminated = subscriber.yield(TransferSessionEvent(sequence: sequence, payload: payload)),
+        if case .terminated = subscriber.yield(TransferSessionEvent(sequence: sequence, payload: payload, wakeOrder: wakeOrder)),
            payload == .backgroundEventsFinished {
             // The manager stopped reading (detached): the next one gets the marker.
-            wakeMarkerOwed = true
+            owedWakeMarkers.append(wakeOrder)
         }
         lastYielded = sequence
     }

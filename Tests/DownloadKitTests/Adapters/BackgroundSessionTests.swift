@@ -145,7 +145,7 @@ final class BackgroundSessionTests: XCTestCase {
 
         let reference = TransferTaskReference(itemID: itemID("a"), generation: 2, taskIdentifier: 5)
         await host.inject(.completed(taskIdentifier: 5, description: TransferTaskReference.taskDescription(itemID: itemID("a"), generation: 2, sessionIdentifier: identifier), failure: .network(code: -1005)))
-        await host.inject(.eventsFinished)
+        await host.inject(.eventsFinished(order: WakeOrder.next()))
         let woke = await recorder.wait { $0.contains { $0.payload == .backgroundEventsFinished } }
         XCTAssertTrue(woke)
         let events = await recorder.events
@@ -165,8 +165,12 @@ final class BackgroundSessionTests: XCTestCase {
 
         try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: inbox.events.path)
         await host.inject(.completed(taskIdentifier: 5, description: TransferTaskReference.taskDescription(itemID: itemID("a"), generation: 2, sessionIdentifier: identifier), failure: .network(code: nil)))
-        await host.inject(.eventsFinished)
+        // The marker's place among the wake handlers is taken in the callback, before the
+        // storage delay; a handler accepted meanwhile is after it.
+        let order = WakeOrder.next()
+        await host.inject(.eventsFinished(order: order))
         await realTimeEventually("event and marker pending") { await host.pendingCount == 2 }
+        let acceptedMeanwhile = WakeOrder.next()
         let early = await recorder.events
         XCTAssertFalse(early.contains { $0.payload == .backgroundEventsFinished }, "the marker never overtakes an unstored event")
 
@@ -179,6 +183,8 @@ final class BackgroundSessionTests: XCTestCase {
         let markerIndex = try XCTUnwrap(events.firstIndex { $0.payload == .backgroundEventsFinished })
         XCTAssertLessThan(failedIndex, markerIndex)
         XCTAssertLessThan(events[failedIndex].sequence, events[markerIndex].sequence)
+        XCTAssertEqual(events[markerIndex].wakeOrder, order, "the order taken in the callback survives the delay")
+        XCTAssertLessThan(events[markerIndex].wakeOrder, acceptedMeanwhile)
     }
 
     func testWakeMarkerArrivingWhileNoManagerReadsIsDeliveredToTheNextOne() async throws {
@@ -191,13 +197,15 @@ final class BackgroundSessionTests: XCTestCase {
         reader.cancel()
         await reader.value
 
-        await host.inject(.eventsFinished)
+        let order = WakeOrder.next()
+        await host.inject(.eventsFinished(order: order))
         let next = try await transport.makeSession(identifier: identifier, storageRoot: root)
         let recorder = EventRecorder.record(next)
         let woke = await recorder.wait { $0.contains { $0.payload == .backgroundEventsFinished } }
         XCTAssertTrue(woke, "the wake marker is owed to the next manager")
         let markers = await recorder.events.filter { $0.payload == .backgroundEventsFinished }
         XCTAssertEqual(markers.count, 1)
+        XCTAssertEqual(markers.first?.wakeOrder, order, "an owed marker keeps its place among the wake handlers")
     }
 
     // MARK: Restarts across a relaunch
