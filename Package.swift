@@ -33,6 +33,9 @@ let package = Package(
         .testTarget(
             name: "DownloadKitUITests",
             dependencies: ["DownloadKitUI"]),
+        .testTarget(
+            name: "DownloadKitPublicAPITests",
+            dependencies: ["DownloadKit"]),
     ],
     swiftLanguageModes: [.v6]
 )
