@@ -55,8 +55,14 @@ struct FileCapture: Sendable {
     /// the file moved. A file in `staging/` therefore always has a durable association with its
     /// item and attempt. When the receipt cannot be written nothing is moved and the attempt
     /// ends with a storage failure: a capture is never claimed without its association.
-    func capture(location: URL, response: URLResponse?, request: URLRequest?, reference: TransferTaskReference) -> Outcome {
+    func capture(location: URL, response: URLResponse?, request: URLRequest?, originalURL: URL?, reference: TransferTaskReference) -> Outcome {
         guard let http = response as? HTTPURLResponse else {
+            return record(.failed(reference, .invalidResponse))
+        }
+        // Checked after the fact, in both modes: a background session follows redirects
+        // without asking its delegate, so the response is the only place a downgrade from
+        // HTTPS shows. Such a body is never captured.
+        if let final = http.url, !ResponseInspector.allowsRedirect(from: originalURL, to: final) {
             return record(.failed(reference, .invalidResponse))
         }
         let size = ((try? FileManager.default.attributesOfItem(atPath: location.path))?[.size] as? NSNumber)?.int64Value ?? 0
@@ -148,6 +154,7 @@ final class TransferDelegate: NSObject, URLSessionDownloadDelegate, Sendable {
             location: location,
             response: downloadTask.response,
             request: downloadTask.currentRequest ?? downloadTask.originalRequest,
+            originalURL: downloadTask.originalRequest?.url,
             reference: reference
         )
         switch outcome {
@@ -170,6 +177,9 @@ final class TransferDelegate: NSObject, URLSessionDownloadDelegate, Sendable {
         channel.yield(.waiting(taskIdentifier: task.taskIdentifier, description: task.taskDescription))
     }
 
+    /// Foreground sessions only: a background session follows redirects automatically and
+    /// never calls this. There, the host's transport-security policy decides which redirects
+    /// are followed, and ``FileCapture`` refuses a body whose final URL left HTTPS.
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
         let original = task.originalRequest?.url
         completionHandler(ResponseInspector.allowsRedirect(from: original, to: request.url) ? request : nil)

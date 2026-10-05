@@ -346,6 +346,32 @@ final class BackgroundSessionTests: XCTestCase {
         await host.invalidate(cancellingTasks: true)
     }
 
+    // MARK: Redirects
+
+    func testABodyWhoseFinalURLLeftHTTPSIsNeverCaptured() throws {
+        let identifier = Harness.uniqueName("session")
+        let inbox = TransferInbox(storageRoot: root, sessionIdentifier: identifier)
+        try inbox.prepare()
+        let capture = FileCapture(storageRoot: root, inbox: inbox, inspector: ResponseInspector(), now: { referenceDate })
+        let reference = TransferTaskReference(itemID: itemID("a"), generation: 1, taskIdentifier: 3)
+        let secure = URL(string: "https://media.example.com/a.mp3")!
+        let plain = URL(string: "http://media.example.com/a.mp3")!
+        let headers = ["Content-Type": "audio/mpeg", "Content-Length": "2048"]
+
+        // A background session followed the redirect without asking: the response shows it.
+        let downgraded = root.appendingPathComponent("downgraded")
+        try StubRoute.body(size: 2_048).write(to: downgraded)
+        let refused = capture.capture(location: downgraded, response: HTTPURLResponse(url: plain, statusCode: 200, httpVersion: nil, headerFields: headers), request: URLRequest(url: plain), originalURL: secure, reference: reference)
+        guard case .receipt(let receipt, _) = refused else { return XCTFail("\(refused)") }
+        XCTAssertEqual(receipt.event.event, .failed(reference, .invalidResponse))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: downgraded.path), "nothing was moved into staging")
+
+        let kept = root.appendingPathComponent("kept")
+        try StubRoute.body(size: 2_048).write(to: kept)
+        let accepted = capture.capture(location: kept, response: HTTPURLResponse(url: secure, statusCode: 200, httpVersion: nil, headerFields: headers), request: URLRequest(url: secure), originalURL: secure, reference: reference)
+        guard case .receipt(let ok, _) = accepted, case .finished = ok.event.event else { return XCTFail("\(accepted)") }
+    }
+
     func testForegroundRelaunchDropsRestartIntentsOfTasksThatCannotSurvive() async throws {
         let identifier = Harness.uniqueName("session")
         let inbox = TransferInbox(storageRoot: root, sessionIdentifier: identifier)

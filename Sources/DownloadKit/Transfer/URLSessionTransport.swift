@@ -19,6 +19,13 @@ import Foundation
 ///   delegate, retained for the life of the process) per identifier, because the system allows
 ///   only one session object per background identifier.
 ///
+/// Redirects: a foreground session asks its delegate, which refuses a redirect from HTTPS to
+/// anything else. A background session follows redirects automatically without asking; there
+/// the host's App Transport Security settings decide which destinations are reachable. In both
+/// modes a finished body whose final URL left HTTPS is refused as an invalid response, never
+/// captured; a task created from resume data may not expose its original request, and then
+/// this check has nothing to compare.
+///
 /// What it guarantees, in both modes:
 /// - Each task carries the description from ``TransferSubmission/taskDescription(sessionIdentifier:)``
 ///   (item, attempt generation and session identity) before it is resumed, so it can be mapped
